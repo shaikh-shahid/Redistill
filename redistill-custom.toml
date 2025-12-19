@@ -1,0 +1,14 @@
+# Custom Redistill Configuration for Testing
+
+[server]
+bind = "127.0.0.1"
+port = 6380  # Different port
+num_shards = 128  # Fewer shards for testing
+batch_size = 32   # Larger batch size
+
+[security]
+password = "test123"  # Test password
+
+[logging]
+level = "debug"
+

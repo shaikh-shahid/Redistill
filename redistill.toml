@@ -1,0 +1,53 @@
+# Redistill Configuration File
+# All settings have sensible defaults
+
+[server]
+# Network settings
+bind = "0.0.0.0"  # Bind address (use "0.0.0.0" for all interfaces)
+port = 6379         # Port to listen on
+
+# Performance settings
+num_shards = 256        # Number of shards for parallel access
+batch_size = 16         # Commands to batch before flushing
+buffer_size = 16384     # Buffer size in bytes (16KB)
+buffer_pool_size = 1024 # Number of pre-allocated buffers
+
+# Connection settings
+max_connections = 10000      # Maximum concurrent connections (0 = unlimited)
+connection_timeout = 300      # Connection timeout in seconds (0 = no timeout)
+connection_rate_limit = 0     # Max new connections per second (0 = unlimited)
+health_check_port = 8080      # HTTP health check port (0 = disabled)
+
+[security]
+# Authentication
+password = ""           # Server password (leave empty to disable auth)
+                       # Can be overridden with REDIS_PASSWORD env var
+
+# TLS/SSL Configuration
+tls_enabled = false     # Enable TLS encryption
+tls_cert_path = "tests/certs/server-cert.pem"  # Path to certificate file
+tls_key_path = "tests/certs/server-key.pem"    # Path to private key file
+
+[logging]
+# Logging configuration
+level = "info"         # Log level: error, warn, info, debug, trace
+format = "text"        # Log format: text, json
+
+[performance]
+# Advanced performance tuning
+tcp_nodelay = true     # Disable Nagle's algorithm for lower latency
+tcp_keepalive = 60     # TCP keepalive in seconds (0 = disabled)
+
+[memory]
+# Memory management
+max_memory = 0                  # Maximum memory in bytes (0 = unlimited)
+                                  # Examples: 1073741824 (1GB), 2147483648 (2GB)
+eviction_policy = "allkeys-lru"   # Policy when memory limit reached:
+                                  #   - allkeys-lru: Evict least recently used keys
+                                  #   - allkeys-random: Evict random keys
+                                  #   - noeviction: Return errors, don't evict
+eviction_sample_size = 5          # Number of keys to sample for eviction (higher = better decisions)
+
+# Note: Persistence is intentionally not implemented
+# Redistill is optimized for in-memory speed
+
