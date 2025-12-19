@@ -7,8 +7,8 @@
 pub use bytes::{Bytes, BytesMut};
 pub use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ==================== Configuration Structures ====================
@@ -90,20 +90,48 @@ pub struct Config {
 }
 
 // Default functions
-fn default_bind() -> String { "127.0.0.1".to_string() }
-fn default_port() -> u16 { 6379 }
-fn default_num_shards() -> usize { 256 }
-fn default_batch_size() -> usize { 16 }
-fn default_buffer_size() -> usize { 16 * 1024 }
-fn default_buffer_pool_size() -> usize { 1024 }
-fn default_max_connections() -> usize { 10000 }
-fn default_connection_timeout() -> u64 { 300 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_log_format() -> String { "text".to_string() }
-fn default_true() -> bool { true }
-fn default_tcp_keepalive() -> u64 { 60 }
-fn default_eviction_policy() -> String { "allkeys-lru".to_string() }
-fn default_eviction_sample_size() -> usize { 5 }
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    6379
+}
+fn default_num_shards() -> usize {
+    256
+}
+fn default_batch_size() -> usize {
+    16
+}
+fn default_buffer_size() -> usize {
+    16 * 1024
+}
+fn default_buffer_pool_size() -> usize {
+    1024
+}
+fn default_max_connections() -> usize {
+    10000
+}
+fn default_connection_timeout() -> u64 {
+    300
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_log_format() -> String {
+    "text".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_tcp_keepalive() -> u64 {
+    60
+}
+fn default_eviction_policy() -> String {
+    "allkeys-lru".to_string()
+}
+fn default_eviction_sample_size() -> usize {
+    5
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -191,7 +219,7 @@ impl EvictionPolicy {
             _ => EvictionPolicy::AllKeysLru, // default
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             EvictionPolicy::NoEviction => "noeviction",
@@ -257,17 +285,20 @@ impl ShardedStore {
     pub fn set(&self, key: Bytes, value: Bytes, ttl: Option<u64>, now: u64) {
         let expiry = ttl.map(|s| now + s);
         let shard = &self.shards[self.hash(&key)];
-        shard.insert(key, Entry { 
-            value, 
-            expiry,
-            last_accessed: AtomicU32::new(0), // Will be set by get_uptime_seconds() in real usage
-        });
+        shard.insert(
+            key,
+            Entry {
+                value,
+                expiry,
+                last_accessed: AtomicU32::new(0), // Will be set by get_uptime_seconds() in real usage
+            },
+        );
     }
 
     #[inline(always)]
     pub fn get(&self, key: &[u8], now: u64) -> Option<Bytes> {
         let shard = &self.shards[self.hash(key)];
-        
+
         // Try read-only access first
         if let Some(entry) = shard.get(key) {
             if let Some(expiry) = entry.expiry {
@@ -278,7 +309,7 @@ impl ShardedStore {
                     return None;
                 }
             }
-            
+
             return Some(entry.value.clone());
         }
         None
@@ -357,7 +388,7 @@ pub fn get_timestamp() -> u64 {
 // Calculate approximate size of an entry
 #[inline(always)]
 pub fn entry_size(key_len: usize, value_len: usize) -> usize {
-    key_len + value_len + 64  // ~64 bytes overhead for Arc, Entry struct, etc.
+    key_len + value_len + 64 // ~64 bytes overhead for Arc, Entry struct, etc.
 }
 
 // Format bytes as human-readable string
@@ -365,7 +396,7 @@ pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
-    
+
     if bytes >= GB {
         format!("{:.2}GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -380,21 +411,18 @@ pub fn format_bytes(bytes: u64) -> String {
 // Fast byte comparison helpers
 #[inline(always)]
 pub fn eq_ignore_case_3(a: &[u8], b: &[u8; 3]) -> bool {
-    a.len() == 3 && 
-    (a[0] | 0x20) == b[0] &&
-    (a[1] | 0x20) == b[1] &&
-    (a[2] | 0x20) == b[2]
+    a.len() == 3 && (a[0] | 0x20) == b[0] && (a[1] | 0x20) == b[1] && (a[2] | 0x20) == b[2]
 }
 
 #[inline(always)]
 pub fn eq_ignore_case_6(a: &[u8], b: &[u8; 6]) -> bool {
-    a.len() == 6 &&
-    (a[0] | 0x20) == b[0] &&
-    (a[1] | 0x20) == b[1] &&
-    (a[2] | 0x20) == b[2] &&
-    (a[3] | 0x20) == b[3] &&
-    (a[4] | 0x20) == b[4] &&
-    (a[5] | 0x20) == b[5]
+    a.len() == 6
+        && (a[0] | 0x20) == b[0]
+        && (a[1] | 0x20) == b[1]
+        && (a[2] | 0x20) == b[2]
+        && (a[3] | 0x20) == b[3]
+        && (a[4] | 0x20) == b[4]
+        && (a[5] | 0x20) == b[5]
 }
 
 // Connection state for authentication
@@ -417,4 +445,3 @@ pub fn evict_if_needed(_store: &ShardedStore, _needed_size: usize) -> bool {
     // In tests with default config (max_memory = 0), always allow
     true
 }
-

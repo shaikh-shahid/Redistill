@@ -16,15 +16,15 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 
 // Configuration structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,9 +46,9 @@ struct ServerConfig {
     #[serde(default = "default_connection_timeout")]
     connection_timeout: u64,
     #[serde(default)]
-    connection_rate_limit: u64,  // Max new connections per second (0 = unlimited)
+    connection_rate_limit: u64, // Max new connections per second (0 = unlimited)
     #[serde(default)]
-    health_check_port: u16,  // HTTP health check port (0 = disabled)
+    health_check_port: u16, // HTTP health check port (0 = disabled)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +82,7 @@ struct PerformanceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryConfig {
     #[serde(default)]
-    max_memory: u64,  // 0 = unlimited
+    max_memory: u64, // 0 = unlimited
     #[serde(default = "default_eviction_policy")]
     eviction_policy: String,
     #[serde(default = "default_eviction_sample_size")]
@@ -123,7 +123,7 @@ impl EvictionPolicy {
             _ => EvictionPolicy::AllKeysLru, // default
         }
     }
-    
+
     fn as_str(&self) -> &'static str {
         match self {
             EvictionPolicy::NoEviction => "noeviction",
@@ -148,18 +148,42 @@ struct Config {
 }
 
 // Default functions
-fn default_bind() -> String { "127.0.0.1".to_string() }
-fn default_port() -> u16 { 6379 }
-fn default_num_shards() -> usize { 256 }
-fn default_batch_size() -> usize { 16 }
-fn default_buffer_size() -> usize { 16 * 1024 }
-fn default_buffer_pool_size() -> usize { 1024 }
-fn default_max_connections() -> usize { 10000 }
-fn default_connection_timeout() -> u64 { 300 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_log_format() -> String { "text".to_string() }
-fn default_true() -> bool { true }
-fn default_tcp_keepalive() -> u64 { 60 }
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    6379
+}
+fn default_num_shards() -> usize {
+    256
+}
+fn default_batch_size() -> usize {
+    16
+}
+fn default_buffer_size() -> usize {
+    16 * 1024
+}
+fn default_buffer_pool_size() -> usize {
+    1024
+}
+fn default_max_connections() -> usize {
+    10000
+}
+fn default_connection_timeout() -> u64 {
+    300
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_log_format() -> String {
+    "text".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_tcp_keepalive() -> u64 {
+    60
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -222,33 +246,37 @@ impl Default for Config {
 impl Config {
     fn load() -> Result<Self, Box<dyn std::error::Error>> {
         // Check for custom config path from env var, otherwise use default
-        let config_path = std::env::var("REDISTILL_CONFIG").unwrap_or_else(|_| "redistill.toml".to_string());
-        
+        let config_path =
+            std::env::var("REDISTILL_CONFIG").unwrap_or_else(|_| "redistill.toml".to_string());
+
         let mut config = if std::path::Path::new(&config_path).exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             toml::from_str(&contents)?
         } else {
             if config_path != "redistill.toml" {
-                eprintln!("⚠️  Config file '{}' not found, using defaults", config_path);
+                eprintln!(
+                    "⚠️  Config file '{}' not found, using defaults",
+                    config_path
+                );
             }
             Config::default()
         };
-        
+
         // Allow ENV vars to override config
         if let Ok(password) = std::env::var("REDIS_PASSWORD") {
             config.security.password = password;
         }
-        
+
         if let Ok(port) = std::env::var("REDIS_PORT") {
             if let Ok(p) = port.parse() {
                 config.server.port = p;
             }
         }
-        
+
         if let Ok(bind) = std::env::var("REDIS_BIND") {
             config.server.bind = bind;
         }
-        
+
         Ok(config)
     }
 }
@@ -289,7 +317,9 @@ static BUFFER_POOL: Lazy<SegQueue<Vec<u8>>> = Lazy::new(|| {
 
 #[inline(always)]
 fn get_buffer() -> Vec<u8> {
-    BUFFER_POOL.pop().unwrap_or_else(|| Vec::with_capacity(CONFIG.server.buffer_size))
+    BUFFER_POOL
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(CONFIG.server.buffer_size))
 }
 
 #[inline(always)]
@@ -304,7 +334,7 @@ fn return_buffer(mut buf: Vec<u8>) {
 struct Entry {
     value: Bytes,
     expiry: Option<u64>,
-    last_accessed: AtomicU32,  // Seconds since server start (for LRU)
+    last_accessed: AtomicU32, // Seconds since server start (for LRU)
 }
 
 impl Clone for Entry {
@@ -354,17 +384,20 @@ impl ShardedStore {
     fn set(&self, key: Bytes, value: Bytes, ttl: Option<u64>, now: u64) {
         let expiry = ttl.map(|s| now + s);
         let shard = &self.shards[self.hash(&key)];
-        shard.insert(key, Entry { 
-            value, 
-            expiry,
-            last_accessed: AtomicU32::new(get_uptime_seconds()),
-        });
+        shard.insert(
+            key,
+            Entry {
+                value,
+                expiry,
+                last_accessed: AtomicU32::new(get_uptime_seconds()),
+            },
+        );
     }
 
     #[inline(always)]
     fn get(&self, key: &[u8], now: u64) -> Option<Bytes> {
         let shard = &self.shards[self.hash(key)];
-        
+
         // Try read-only access first
         if let Some(entry) = shard.get(key) {
             if let Some(expiry) = entry.expiry {
@@ -375,10 +408,10 @@ impl ShardedStore {
                     return None;
                 }
             }
-            
+
             // Update access time approximately (90% skip for performance)
             maybe_update_access_time(&entry);
-            
+
             return Some(entry.value.clone());
         }
         None
@@ -652,8 +685,8 @@ impl RespWriter {
             stream.write_all(&self.buffer).await.map_err(|_| ())?;
             self.buffer.clear();
         }
-    Ok(())
-}
+        Ok(())
+    }
 }
 
 impl Drop for RespWriter {
@@ -688,41 +721,43 @@ fn maybe_update_access_time(entry: &Entry) {
     if CONFIG.memory.max_memory == 0 {
         return;
     }
-    
+
     // Fast path: skip 90% of updates for performance
     if fastrand::u8(..100) < 90 {
         return;
     }
     // Slow path: update access time
-    entry.last_accessed.store(get_uptime_seconds(), Ordering::Relaxed);
+    entry
+        .last_accessed
+        .store(get_uptime_seconds(), Ordering::Relaxed);
 }
 
 // Calculate approximate size of an entry
 #[inline(always)]
 fn entry_size(key_len: usize, value_len: usize) -> usize {
-    key_len + value_len + 64  // ~64 bytes overhead for Arc, Entry struct, etc.
+    key_len + value_len + 64 // ~64 bytes overhead for Arc, Entry struct, etc.
 }
 
 // Check connection rate limit
 #[inline]
 fn check_rate_limit() -> bool {
     let rate_limit = CONFIG.server.connection_rate_limit;
-    
+
     // No rate limit
     if rate_limit == 0 {
         return true;
     }
-    
+
     let now = get_timestamp();
     let last_check = LAST_CONNECTION_CHECK.load(Ordering::Relaxed);
-    
+
     // New second - reset counter
     if now > last_check {
         LAST_CONNECTION_CHECK.store(now, Ordering::Relaxed);
         CONNECTIONS_THIS_SECOND.store(1, Ordering::Relaxed);
         return true;
     }
-    
+
     // Same second - check limit
     let count = CONNECTIONS_THIS_SECOND.fetch_add(1, Ordering::Relaxed);
     count < rate_limit
@@ -733,7 +768,7 @@ fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
-    
+
     if bytes >= GB {
         format!("{:.2}GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -748,21 +783,18 @@ fn format_bytes(bytes: u64) -> String {
 // Fast byte comparison helpers
 #[inline(always)]
 fn eq_ignore_case_3(a: &[u8], b: &[u8; 3]) -> bool {
-    a.len() == 3 && 
-    (a[0] | 0x20) == b[0] &&
-    (a[1] | 0x20) == b[1] &&
-    (a[2] | 0x20) == b[2]
+    a.len() == 3 && (a[0] | 0x20) == b[0] && (a[1] | 0x20) == b[1] && (a[2] | 0x20) == b[2]
 }
 
 #[inline(always)]
 fn eq_ignore_case_6(a: &[u8], b: &[u8; 6]) -> bool {
-    a.len() == 6 &&
-    (a[0] | 0x20) == b[0] &&
-    (a[1] | 0x20) == b[1] &&
-    (a[2] | 0x20) == b[2] &&
-    (a[3] | 0x20) == b[3] &&
-    (a[4] | 0x20) == b[4] &&
-    (a[5] | 0x20) == b[5]
+    a.len() == 6
+        && (a[0] | 0x20) == b[0]
+        && (a[1] | 0x20) == b[1]
+        && (a[2] | 0x20) == b[2]
+        && (a[3] | 0x20) == b[3]
+        && (a[4] | 0x20) == b[4]
+        && (a[5] | 0x20) == b[5]
 }
 
 // Connection state for authentication
@@ -783,47 +815,47 @@ impl ConnectionState {
 #[inline(always)]
 fn evict_if_needed(store: &ShardedStore, needed_size: usize) -> bool {
     let max_memory = CONFIG.memory.max_memory;
-    
+
     // Fast path: unlimited memory (zero-cost)
     if max_memory == 0 {
         return true;
     }
-    
+
     // Check if eviction needed (relaxed for performance)
     let current = MEMORY_USED.load(Ordering::Relaxed);
     if current + needed_size as u64 <= max_memory {
         return true;
     }
-    
+
     // Get eviction policy
     let policy = EvictionPolicy::from_str(&CONFIG.memory.eviction_policy);
-    
+
     // No eviction policy - reject new keys
     if policy == EvictionPolicy::NoEviction {
         return false;
     }
-    
+
     // Evict until we have enough space
     let mut freed = 0;
     let mut attempts = 0;
-    let max_attempts = 100;  // Prevent infinite loop
-    
+    let max_attempts = 100; // Prevent infinite loop
+
     while freed < needed_size && attempts < max_attempts {
         attempts += 1;
-        
+
         let evicted = match policy {
             EvictionPolicy::AllKeysLru => evict_lru(store),
             EvictionPolicy::AllKeysRandom => evict_random(store),
             EvictionPolicy::NoEviction => break,
         };
-        
+
         if evicted == 0 {
-            break;  // No more keys to evict
+            break; // No more keys to evict
         }
-        
+
         freed += evicted;
     }
-    
+
     freed >= needed_size
 }
 
@@ -831,20 +863,20 @@ fn evict_if_needed(store: &ShardedStore, needed_size: usize) -> bool {
 #[inline]
 fn evict_lru(store: &ShardedStore) -> usize {
     let sample_size = CONFIG.memory.eviction_sample_size;
-    
+
     // Sample keys from random shards
     let mut oldest_key: Option<Bytes> = None;
     let mut oldest_time: u32 = u32::MAX;
     let mut oldest_shard_idx = 0;
-    
+
     for _ in 0..sample_size {
         let shard_idx = fastrand::usize(..store.num_shards);
         let shard = &store.shards[shard_idx];
-        
+
         // Get a random key from this shard
         if let Some(entry) = shard.iter().next() {
             let last_accessed = entry.value().last_accessed.load(Ordering::Relaxed);
-            
+
             if oldest_key.is_none() || last_accessed < oldest_time {
                 oldest_key = Some(entry.key().clone());
                 oldest_time = last_accessed;
@@ -852,7 +884,7 @@ fn evict_lru(store: &ShardedStore) -> usize {
             }
         }
     }
-    
+
     // Evict the oldest key
     if let Some(key) = oldest_key {
         let key_len = key.len();
@@ -864,7 +896,7 @@ fn evict_lru(store: &ShardedStore) -> usize {
             return size;
         }
     }
-    
+
     0
 }
 
@@ -874,14 +906,14 @@ fn evict_random(store: &ShardedStore) -> usize {
     // Pick a random shard
     let shard_idx = fastrand::usize(..store.num_shards);
     let shard = &store.shards[shard_idx];
-    
+
     // Get first key (effectively random due to HashMap internals)
     if let Some(entry) = shard.iter().next() {
         let key = entry.key().clone();
         let key_len = key.len();
         let value_len = entry.value().value.len();
         drop(entry);
-        
+
         if let Some((_, _)) = shard.remove(&key) {
             let size = entry_size(key_len, value_len);
             MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
@@ -889,7 +921,7 @@ fn evict_random(store: &ShardedStore) -> usize {
             return size;
         }
     }
-    
+
     0
 }
 
@@ -909,16 +941,16 @@ fn execute_command(
     }
 
     let cmd = &command[0];
-    
+
     // AUTH and PING don't require authentication
     let requires_auth = !matches!(cmd.len(), 4 if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h')
         && !matches!(cmd.len(), 4 if eq_ignore_case_3(&cmd[..3], b"pin") && (cmd[3] | 0x20) == b'g');
-    
+
     if requires_auth && !state.authenticated {
         writer.write_error(b"NOAUTH Authentication required");
         return;
     }
-    
+
     // Optimized command matching
     match cmd.len() {
         3 => {
@@ -926,14 +958,15 @@ fn execute_command(
                 if command.len() >= 3 {
                     let key = &command[1];
                     let value = &command[2];
-                    
+
                     // Check memory limit before setting
                     let size = entry_size(key.len(), value.len());
                     if !evict_if_needed(store, size) {
-                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        writer
+                            .write_error(b"OOM command not allowed when used memory > 'maxmemory'");
                         return;
                     }
-                    
+
                     let mut ttl = None;
                     if command.len() >= 5 && command[3].len() == 2 {
                         let ex = &command[3];
@@ -952,14 +985,14 @@ fn execute_command(
                             }
                         }
                     }
-                    
+
                     store.set(key.clone(), value.clone(), ttl, now);
-                    
+
                     // Track memory usage (only if limits enabled)
                     if CONFIG.memory.max_memory > 0 {
                         MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
                     }
-                    
+
                     writer.write_simple_string(b"OK");
                 } else {
                     writer.write_error(b"wrong number of arguments");
@@ -969,9 +1002,7 @@ fn execute_command(
             if eq_ignore_case_3(cmd, b"get") {
                 if command.len() >= 2 {
                     match store.get(&command[1], now) {
-                        Some(value) => {
-                            writer.write_bulk_string(&value)
-                        },
+                        Some(value) => writer.write_bulk_string(&value),
                         None => writer.write_null(),
                     }
                 } else {
@@ -1029,7 +1060,7 @@ fn execute_command(
                 let max_memory = CONFIG.memory.max_memory;
                 let eviction_policy = EvictionPolicy::from_str(&CONFIG.memory.eviction_policy);
                 let rejected_connections = REJECTED_CONNECTIONS.load(Ordering::Relaxed);
-                
+
                 let info = format!(
                     "# Server\r\n\
                     redis_version:7.0.0\r\n\
@@ -1063,7 +1094,11 @@ fn execute_command(
                     memory_used,
                     format_bytes(memory_used),
                     max_memory,
-                    if max_memory > 0 { format_bytes(max_memory) } else { "unlimited".to_string() },
+                    if max_memory > 0 {
+                        format_bytes(max_memory)
+                    } else {
+                        "unlimited".to_string()
+                    },
                     eviction_policy.as_str(),
                     evicted_keys,
                     total_connections,
@@ -1098,8 +1133,13 @@ fn execute_command(
         7 => {
             if cmd.len() == 7 {
                 let lower = [
-                    cmd[0] | 0x20, cmd[1] | 0x20, cmd[2] | 0x20, cmd[3] | 0x20,
-                    cmd[4] | 0x20, cmd[5] | 0x20, cmd[6] | 0x20,
+                    cmd[0] | 0x20,
+                    cmd[1] | 0x20,
+                    cmd[2] | 0x20,
+                    cmd[3] | 0x20,
+                    cmd[4] | 0x20,
+                    cmd[5] | 0x20,
+                    cmd[6] | 0x20,
                 ];
                 if &lower == b"flushdb" {
                     store.clear();
@@ -1174,44 +1214,45 @@ impl MaybeStream {
 }
 
 // Load TLS configuration from certificate files
-async fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<RustlsServerConfig>, Box<dyn std::error::Error>> {
+async fn load_tls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<Arc<RustlsServerConfig>, Box<dyn std::error::Error>> {
     use rustls_pemfile::{certs, pkcs8_private_keys};
     use std::io::BufReader;
-    
+
     // Read certificate file
     let cert_file = tokio::fs::read(cert_path).await?;
     let mut cert_reader = BufReader::new(cert_file.as_slice());
-    let certs: Vec<_> = certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()?;
-    
+    let certs: Vec<_> = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
     if certs.is_empty() {
         return Err("No certificates found in cert file".into());
     }
-    
+
     // Read private key file
     let key_file = tokio::fs::read(key_path).await?;
     let mut key_reader = BufReader::new(key_file.as_slice());
-    let mut keys = pkcs8_private_keys(&mut key_reader)
-        .collect::<Result<Vec<_>, _>>()?;
-    
+    let mut keys = pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
+
     if keys.is_empty() {
         return Err("No private keys found in key file".into());
     }
-    
+
     let key = keys.remove(0).into();
-    
+
     // Build TLS configuration
     let config = RustlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    
+
     Ok(Arc::new(config))
 }
 
 async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
     // Set TCP options from config
     let _ = stream.set_nodelay(CONFIG.performance.tcp_nodelay);
-    
+
     // Track connection
     TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1223,20 +1264,20 @@ async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
 
     loop {
         let now = get_timestamp();
-        
+
         match parser.parse_command(&mut stream).await {
             Ok(command) => {
                 execute_command(&store, &command, &mut writer, &mut state, now);
                 batch_count += 1;
-                
+
                 // Smart flushing:
                 // 1. If buffer is large, flush immediately
                 // 2. If we hit batch size, flush
                 // 3. If no more commands buffered (interactive mode), flush
-                let should_flush = writer.should_flush() 
-                    || batch_count >= CONFIG.server.batch_size 
+                let should_flush = writer.should_flush()
+                    || batch_count >= CONFIG.server.batch_size
                     || !parser.has_buffered_data();
-                
+
                 if should_flush {
                     if writer.flush(&mut stream).await.is_err() {
                         break;
@@ -1251,13 +1292,15 @@ async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
             }
         }
     }
-    
+
     // Cleanup: decrement active connections
     ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
 }
 
-// Health check HTTP handler  
-async fn handle_health_check(_req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+// Health check HTTP handler
+async fn handle_health_check(
+    _req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let status = format!(
         r#"{{"status":"ok","uptime_seconds":{},"active_connections":{},"total_connections":{},"rejected_connections":{},"memory_used":{},"max_memory":{},"evicted_keys":{},"total_commands":{}}}"#,
         START_TIME.elapsed().unwrap_or_default().as_secs(),
@@ -1269,13 +1312,13 @@ async fn handle_health_check(_req: Request<hyper::body::Incoming>) -> Result<Res
         EVICTED_KEYS.load(Ordering::Relaxed),
         TOTAL_COMMANDS.load(Ordering::Relaxed)
     );
-    
+
     let response = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(status)))
         .unwrap();
-    
+
     Ok(response)
 }
 
@@ -1285,21 +1328,24 @@ async fn start_health_check_server(port: u16) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("⚠️  Failed to bind health check endpoint on {}: {}", addr, e);
+            eprintln!(
+                "⚠️  Failed to bind health check endpoint on {}: {}",
+                addr, e
+            );
             return;
         }
     };
-    
+
     println!("🏥 Health check endpoint: http://{}/health", addr);
-    
+
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(_) => continue,
         };
-        
+
         let io = TokioIo::new(stream);
-        
+
         tokio::spawn(async move {
             let _ = http1::Builder::new()
                 .serve_connection(io, service_fn(handle_health_check))
@@ -1312,12 +1358,12 @@ async fn start_health_check_server(port: u16) {
 async fn main() {
     // Load configuration
     let config = &*CONFIG;
-    
+
     // Initialize server start time
     SERVER_START_TIME.store(get_timestamp() as u32, Ordering::Relaxed);
-    
+
     let store = ShardedStore::new(config.server.num_shards);
-    
+
     println!(
         r#"
 ╔══════════════════════════════════════════════════════════════╗
@@ -1357,10 +1403,26 @@ async fn main() {
         config.server.buffer_pool_size,
         config.server.buffer_size / 1024,
         config.server.batch_size,
-        if !config.security.password.is_empty() { "enabled" } else { "disabled" },
-        if config.security.tls_enabled { "enabled" } else { "disabled" },
-        if config.performance.tcp_nodelay { "enabled" } else { "disabled" },
-        if config.memory.max_memory > 0 { format_bytes(config.memory.max_memory) } else { "unlimited".to_string() },
+        if !config.security.password.is_empty() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if config.security.tls_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if config.performance.tcp_nodelay {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if config.memory.max_memory > 0 {
+            format_bytes(config.memory.max_memory)
+        } else {
+            "unlimited".to_string()
+        },
         config.memory.eviction_policy,
         config.server.batch_size,
         config.server.num_shards
@@ -1372,8 +1434,13 @@ async fn main() {
             eprintln!("❌ TLS enabled but cert/key paths not configured");
             std::process::exit(1);
         }
-        
-        match load_tls_config(&config.security.tls_cert_path, &config.security.tls_key_path).await {
+
+        match load_tls_config(
+            &config.security.tls_cert_path,
+            &config.security.tls_key_path,
+        )
+        .await
+        {
             Ok(tls_config) => {
                 println!("🔐 TLS/SSL enabled");
                 println!("   • Certificate: {}", config.security.tls_cert_path);
@@ -1389,30 +1456,31 @@ async fn main() {
     } else {
         None
     };
-    
+
     let bind_addr = format!("{}:{}", config.server.bind, config.server.port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("❌ Failed to bind to {}: {}", bind_addr, e);
-            std::process::exit(1);
-        });
+    let listener = TcpListener::bind(&bind_addr).await.unwrap_or_else(|e| {
+        eprintln!("❌ Failed to bind to {}: {}", bind_addr, e);
+        std::process::exit(1);
+    });
 
     println!("🎧 Listening on {}", bind_addr);
-    
+
     if !config.security.password.is_empty() {
         println!("🔒 Authentication enabled (password set in config or env var)");
     } else {
-        println!("⚠️  Authentication disabled (set password in config file or REDIS_PASSWORD env var)");
+        println!(
+            "⚠️  Authentication disabled (set password in config file or REDIS_PASSWORD env var)"
+        );
     }
-    
-    let config_file = std::env::var("REDISTILL_CONFIG").unwrap_or_else(|_| "redistill.toml".to_string());
+
+    let config_file =
+        std::env::var("REDISTILL_CONFIG").unwrap_or_else(|_| "redistill.toml".to_string());
     if std::path::Path::new(&config_file).exists() {
         println!("📄 Configuration loaded from {}", config_file);
     } else {
         println!("📄 Using default configuration (create redistill.toml to customize)");
     }
-    
+
     // Start health check endpoint if enabled
     if config.server.health_check_port > 0 {
         let health_port = config.server.health_check_port;
@@ -1420,7 +1488,7 @@ async fn main() {
             start_health_check_server(health_port).await;
         });
     }
-    
+
     println!();
 
     loop {
@@ -1435,17 +1503,17 @@ async fn main() {
                             drop(tcp_stream);  // Close connection
                             continue;
                         }
-                        
+
                         // Check connection rate limit
                         if !check_rate_limit() {
                             REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
                             drop(tcp_stream);  // Close connection
                             continue;
                         }
-                        
+
                         let store_clone = store.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
-                        
+
                         tokio::spawn(async move {
                             // Wrap in TLS if enabled
                             let stream = if let Some(acceptor) = tls_acceptor_clone {
@@ -1459,7 +1527,7 @@ async fn main() {
                             } else {
                                 MaybeStream::Plain(tcp_stream)
                             };
-                            
+
                             handle_connection(stream, store_clone).await;
                         });
                     }

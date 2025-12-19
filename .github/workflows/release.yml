@@ -9,49 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - name: Get version from tag
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Redistill ${{ steps.get_version.outputs.version }}
-          body: |
-            ## Redistill ${{ steps.get_version.outputs.version }}
-            
-            High-performance Redis-compatible key-value store.
-            
-            ### Downloads
-            Download the appropriate binary for your platform below.
-            
-            ### Changelog
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/docs/CHANGELOG.md) for details.
-            
-            ### Installation
-            1. Download the binary for your platform
-            2. Extract: `tar -xzf redistill-*.tar.gz` (or unzip for Windows)
-            3. Make executable (Unix): `chmod +x redistill`
-            4. Run: `./redistill`
-            
-            See [Quick Start Guide](https://github.com/${{ github.repository }}/blob/main/docs/QUICKSTART.md) for more details.
-          draft: false
-          prerelease: false
-
   build:
     name: Build ${{ matrix.target }}
-    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -142,53 +101,104 @@ jobs:
             strip target/${{ matrix.target }}/release/redistill
           fi
 
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
       - name: Create archive (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf ../../../redistill-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz redistill
+          tar -czf ../../../redistill-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.tar.gz redistill
           cd ../../..
 
       - name: Create archive (Windows)
         if: matrix.archive == 'zip'
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../redistill-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip redistill.exe
+          7z a ../../../redistill-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.zip redistill.exe
           cd ../../..
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./redistill-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
-          asset_name: redistill-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
-          asset_content_type: ${{ matrix.archive == 'tar.gz' && 'application/gzip' || 'application/zip' }}
+          name: redistill-${{ steps.get_version.outputs.version }}-${{ matrix.target }}
+          path: redistill-${{ steps.get_version.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
 
-  checksums:
-    name: Generate Checksums
-    needs: [create-release, build]
+  release:
+    name: Create Release
+    needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
       - name: Download all artifacts
         uses: actions/download-artifact@v3
         with:
           path: artifacts
 
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec mv {} release-assets/ \;
+
       - name: Generate checksums
         run: |
-          cd artifacts
-          sha256sum * > ../checksums.txt
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
           cd ..
 
-      - name: Upload checksums
-        uses: actions/upload-release-asset@v1
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Redistill v${{ steps.get_version.outputs.version }}
+          body: |
+            ## Redistill v${{ steps.get_version.outputs.version }}
+            
+            High-performance Redis-compatible key-value store.
+            
+            ### Platform Downloads
+            
+            **Linux:**
+            - `x86_64-unknown-linux-gnu` - Standard Linux (glibc)
+            - `x86_64-unknown-linux-musl` - Static binary (works everywhere)
+            - `aarch64-unknown-linux-gnu` - ARM64/AArch64
+            
+            **macOS:**
+            - `x86_64-apple-darwin` - Intel Macs
+            - `aarch64-apple-darwin` - Apple Silicon (M1/M2/M3)
+            
+            **Windows:**
+            - `x86_64-pc-windows-msvc` - 64-bit Windows
+            
+            ### Installation
+            
+            **Linux/macOS:**
+            ```bash
+            tar -xzf redistill-*.tar.gz
+            chmod +x redistill
+            ./redistill
+            ```
+            
+            **Windows:**
+            ```powershell
+            Expand-Archive redistill-*.zip
+            .\redistill.exe
+            ```
+            
+            ### Verification
+            Verify your download with SHA256 checksums in `SHA256SUMS.txt`.
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./checksums.txt
-          asset_name: checksums.txt
-          asset_content_type: text/plain
 
