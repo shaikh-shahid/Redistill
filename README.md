@@ -13,19 +13,52 @@ Redistill is a drop-in Redis replacement optimized for caching and ephemeral dat
 
 **Key characteristics:**
 - Redis protocol compatible
-- 2.1M operations/second (vs Redis 1.0M ops/s)
+- Up to 5.9M GET operations/second (vs Redis 3.1M ops/s)
+- 49% faster SET operations under production workloads
 - Zero persistence overhead
 - Production-ready security and monitoring features
 
 ## Performance
 
-Benchmark results on identical hardware (MacBook Pro M2, 14 cores):
+Benchmark results on AWS c7i-flex.8xlarge (32 cores, production workload with `batch_size=16`):
 
 | Workload | Redistill | Redis | Improvement |
 |----------|-----------|-------|-------------|
-| Pipelined SET (-P 16) | 2.18M ops/s | 1.87M ops/s | +17% |
-| Pipelined GET (-P 16) | 2.27M ops/s | 2.16M ops/s | +5% |
-| Extreme Pipeline (-P 64) | 4.73M ops/s | 2.42M ops/s | +95% |
+| Interactive (-c 1, -P 1) | 20K ops/s | 20K ops/s | Similar |
+| Production SET (-c 50, -P 16) | 2.34M ops/s | 1.57M ops/s | **+49%** |
+| Production GET (-c 50, -P 16) | 2.38M ops/s | 1.95M ops/s | **+21%** |
+| High Concurrency GET (-c 300, -P 32) | 3.16M ops/s | 2.70M ops/s | **+17%** |
+| Extreme GET (-c 100, -P 64) | 5.99M ops/s | 3.10M ops/s | **+93%** |
+| Ultra GET (-c 500, -P 128) | 5.87M ops/s | 3.40M ops/s | **+72%** |
+
+**Key Takeaways:**
+- GET operations with high pipelining: up to **93% faster** than Redis
+- Production workloads: **21-49% improvement** over Redis
+- Linear scalability with pipelining and concurrency
+
+### Tuning for Extreme Pipelines
+
+For workloads with very deep pipelining (P > 64), increase the `batch_size` to match your pipeline depth.
+
+**Performance with `batch_size=256` on AWS c7i-flex.8xlarge:**
+
+| Workload | Redistill (batch=16) | Redistill (batch=256) | Redis | Improvement |
+|----------|----------------------|-----------------------|-------|-------------|
+| Extreme SET (-c 100, -P 64) | 2.26M ops/s | **2.53M ops/s** | 2.51M ops/s | **+0.8%** vs Redis |
+| Extreme GET (-c 100, -P 64) | 5.99M ops/s | **6.80M ops/s** | 3.23M ops/s | **+110%** vs Redis |
+| Ultra SET (-c 500, -P 128) | 2.18M ops/s | **2.52M ops/s** | 2.67M ops/s | -5.6% vs Redis |
+| Ultra GET (-c 500, -P 128) | 5.87M ops/s | **6.83M ops/s** | 3.47M ops/s | **+97%** vs Redis |
+
+**Configuration:**
+```toml
+[server]
+batch_size = 256  # Match or exceed your pipeline depth
+```
+
+**Performance Gains with Larger Batch Size:**
+- SET operations: +12-16% improvement at extreme pipeline depths
+- GET operations: +14-16% improvement, maintaining ~2x Redis performance
+- Fewer write syscalls = lower overhead at high concurrency
 
 ## Quick Start
 
@@ -236,8 +269,9 @@ Built with:
 
 | Feature | Redistill | Redis |
 |---------|-----------|-------|
-| Throughput (pipelined) | 2.1M ops/s | 1.0M ops/s |
-| Latency (p50) | 0.20ms | 0.37ms |
+| Throughput (pipelined GET) | 5.9M ops/s | 3.1M ops/s |
+| Throughput (pipelined SET) | 2.3M ops/s | 1.6M ops/s |
+| Latency (p50, pipelined) | 0.21ms | 0.35ms |
 | Memory overhead | Minimal | Moderate |
 | Persistence | No | Yes (AOF/RDB) |
 | Replication | No | Yes |
