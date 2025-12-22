@@ -4,7 +4,6 @@
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use bytes::{Buf, Bytes, BytesMut};
-use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::server::conn::http1;
@@ -306,29 +305,7 @@ static CONNECTIONS_THIS_SECOND: AtomicU64 = AtomicU64::new(0);
 static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static START_TIME: Lazy<SystemTime> = Lazy::new(SystemTime::now);
 
-// Buffer pool for zero-allocation response writing
-static BUFFER_POOL: Lazy<SegQueue<Vec<u8>>> = Lazy::new(|| {
-    let pool = SegQueue::new();
-    for _ in 0..CONFIG.server.buffer_pool_size {
-        pool.push(Vec::with_capacity(CONFIG.server.buffer_size));
-    }
-    pool
-});
-
-#[inline(always)]
-fn get_buffer() -> Vec<u8> {
-    BUFFER_POOL
-        .pop()
-        .unwrap_or_else(|| Vec::with_capacity(CONFIG.server.buffer_size))
-}
-
-#[inline(always)]
-fn return_buffer(mut buf: Vec<u8>) {
-    buf.clear();
-    if buf.capacity() <= CONFIG.server.buffer_size * 2 {
-        BUFFER_POOL.push(buf);
-    }
-}
+// Per-connection buffers (no global pool - eliminates contention)
 
 // Entry with Bytes for zero-copy
 struct Entry {
@@ -603,7 +580,7 @@ struct RespWriter {
 impl RespWriter {
     fn new() -> Self {
         Self {
-            buffer: get_buffer(),
+            buffer: Vec::with_capacity(CONFIG.server.buffer_size),
         }
     }
 
@@ -689,12 +666,8 @@ impl RespWriter {
     }
 }
 
-impl Drop for RespWriter {
-    fn drop(&mut self) {
-        let buf = std::mem::replace(&mut self.buffer, Vec::new());
-        return_buffer(buf);
-    }
-}
+// RespWriter buffer is automatically dropped when connection closes
+// No pool return needed - eliminates contention!
 
 #[inline(always)]
 fn get_timestamp() -> u64 {
@@ -1374,8 +1347,7 @@ async fn main() {
    • Bind Address: {}:{}
    • Shards: {}
    • CPU Cores: {}
-   • Buffer Pool: {} buffers
-   • Buffer Size: {} KB
+   • Per-Connection Buffers: {} KB (zero contention)
    • Batch Size: {} commands
    • Authentication: {}
    • TLS/SSL: {}
@@ -1386,7 +1358,7 @@ async fn main() {
 ⚡ Optimizations:
    ✓ DashMap lock-free concurrent hashmap
    ✓ Zero-copy Bytes (no string allocations)
-   ✓ Buffer pooling (no allocations)
+   ✓ Per-connection buffers (zero contention!)
    ✓ Batched writes ({} commands per flush)
    ✓ Sharded storage ({} shards)
    ✓ FNV-1a fast hashing
@@ -1400,7 +1372,6 @@ async fn main() {
         config.server.port,
         config.server.num_shards,
         num_cpus::get(),
-        config.server.buffer_pool_size,
         config.server.buffer_size / 1024,
         config.server.batch_size,
         if !config.security.password.is_empty() {
