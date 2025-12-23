@@ -155,7 +155,7 @@ fn default_port() -> u16 {
     6379
 }
 fn default_num_shards() -> usize {
-    256
+    2048  // Optimized for extreme concurrency - best balance of performance and memory
 }
 fn default_batch_size() -> usize {
     16
