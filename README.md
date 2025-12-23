@@ -108,6 +108,10 @@ eviction_policy = "allkeys-lru" # LRU eviction
 
 ## Quick Start
 
+Download the suitable binaries for your machine and operating system from (Releases)[https://github.com/shaikh-shahid/Redistill/releases] page.
+
+Or you can build the project from source code.
+
 ### Requirements
 
 - Rust 1.70 or higher
