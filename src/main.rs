@@ -26,6 +26,10 @@ use tokio::signal;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 
+// Security limits for RESP protocol parsing (prevent DoS attacks)
+const MAX_ARRAY_LEN: usize = 1_000_000;      // Max 1M commands in array
+const MAX_STRING_LEN: usize = 512_000_000;   // Max 512MB per string (Redis default)
+
 // Configuration structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
@@ -412,8 +416,16 @@ impl ShardedStore {
             if let Some(expiry) = entry.expiry {
                 if now >= expiry {
                     // Expired - need to remove
+                    let key_len = key.len();
+                    let value_len = entry.value.len();
                     drop(entry);
                     shard.remove(key);
+                    
+                    // Decrement memory tracking
+                    if CONFIG.memory.max_memory > 0 {
+                        let size = entry_size(key_len, value_len);
+                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    }
                     return None;
                 }
             }
@@ -551,6 +563,12 @@ impl RespParser {
                 return Err(());
             }
             array_len = array_len * 10 + (byte - b'0') as usize;
+            
+            // Security: Prevent DoS via massive array allocation
+            if array_len > MAX_ARRAY_LEN {
+                return Err(());
+            }
+            
             cursor += 1;
         }
 
@@ -580,6 +598,12 @@ impl RespParser {
                     return Err(());
                 }
                 str_len = str_len * 10 + (byte - b'0') as usize;
+                
+                // Security: Prevent DoS via massive string allocation
+                if str_len > MAX_STRING_LEN {
+                    return Err(());
+                }
+                
                 cursor += 1;
             }
 
@@ -747,7 +771,7 @@ fn entry_size(key_len: usize, value_len: usize) -> usize {
     key_len + value_len + 64 // ~64 bytes overhead for Arc, Entry struct, etc.
 }
 
-// Check connection rate limit
+// Check connection rate limit (TOCTOU race fixed with compare_exchange)
 #[inline]
 fn check_rate_limit() -> bool {
     let rate_limit = CONFIG.server.connection_rate_limit;
@@ -758,17 +782,30 @@ fn check_rate_limit() -> bool {
     }
 
     let now = get_timestamp();
-    let last_check = LAST_CONNECTION_CHECK.load(Ordering::Relaxed);
+    let last_check = LAST_CONNECTION_CHECK.load(Ordering::Acquire);
 
-    // New second - reset counter
+    // New second - atomically reset counter
     if now > last_check {
-        LAST_CONNECTION_CHECK.store(now, Ordering::Relaxed);
-        CONNECTIONS_THIS_SECOND.store(1, Ordering::Relaxed);
-        return true;
+        // Try to atomically update the timestamp
+        match LAST_CONNECTION_CHECK.compare_exchange(
+            last_check,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire
+        ) {
+            Ok(_) => {
+                // We won the race - reset counter
+                CONNECTIONS_THIS_SECOND.store(1, Ordering::Release);
+                return true;
+            }
+            Err(_) => {
+                // Someone else reset it - fall through to increment
+            }
+        }
     }
 
     // Same second - check limit
-    let count = CONNECTIONS_THIS_SECOND.fetch_add(1, Ordering::Relaxed);
+    let count = CONNECTIONS_THIS_SECOND.fetch_add(1, Ordering::AcqRel);
     count < rate_limit
 }
 
@@ -995,25 +1032,54 @@ fn execute_command(
                     if command.len() >= 5 && command[3].len() == 2 {
                         let ex = &command[3];
                         if (ex[0] | 0x20) == b'e' && (ex[1] | 0x20) == b'x' {
-                            // Parse TTL
+                            // Parse TTL strictly - error on invalid format
                             let ttl_bytes = &command[4];
                             let mut val = 0u64;
-                            for &b in ttl_bytes.iter() {
-                                if !(b'0'..=b'9').contains(&b) {
-                                    break;
+                            let mut valid = true;
+                            
+                            // Check all bytes are digits
+                            if ttl_bytes.is_empty() {
+                                valid = false;
+                            } else {
+                                for &b in ttl_bytes.iter() {
+                                    if !(b'0'..=b'9').contains(&b) {
+                                        valid = false;
+                                        break;
+                                    }
+                                    val = val * 10 + (b - b'0') as u64;
                                 }
-                                val = val * 10 + (b - b'0') as u64;
                             }
-                            if val > 0 {
-                                ttl = Some(val);
+                            
+                            if !valid || val == 0 {
+                                writer.write_error(b"value is not an integer or out of range");
+                                return;
                             }
+                            
+                            ttl = Some(val);
                         }
                     }
+
+                    // Check if key exists (for memory tracking on overwrites)
+                    let old_size = if CONFIG.memory.max_memory > 0 {
+                        let shard_idx = store.hash(key);
+                        let shard = &store.shards[shard_idx];
+                        if let Some(old_entry) = shard.get(key) {
+                            entry_size(key.len(), old_entry.value.len())
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
 
                     store.set(key.clone(), value.clone(), ttl, now);
 
                     // Track memory usage (only if limits enabled)
                     if CONFIG.memory.max_memory > 0 {
+                        // Subtract old, add new
+                        if old_size > 0 {
+                            MEMORY_USED.fetch_sub(old_size as u64, Ordering::Relaxed);
+                        }
                         MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
                     }
 
