@@ -19,16 +19,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+use subtle::ConstantTimeEq;
 
 // Security limits for RESP protocol parsing (prevent DoS attacks)
 const MAX_ARRAY_LEN: usize = 1_000_000;      // Max 1M commands in array
 const MAX_STRING_LEN: usize = 512_000_000;   // Max 512MB per string (Redis default)
+const MAX_BUFFER_SIZE: usize = 1_073_741_824; // Max 1GB buffer per connection (DoS protection)
 
 // Configuration structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +155,7 @@ struct Config {
 
 // Default functions
 fn default_bind() -> String {
-    "127.0.0.1".to_string()
+    "0.0.0.0".to_string()
 }
 fn default_port() -> u16 {
     6379
@@ -281,7 +283,43 @@ impl Config {
             config.server.bind = bind;
         }
 
+        // Validate configuration
+        config.validate()?;
+
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Prevent division by zero and other critical errors
+        if self.server.num_shards == 0 {
+            return Err("num_shards must be greater than 0".into());
+        }
+        if self.server.buffer_size == 0 {
+            return Err("buffer_size must be greater than 0".into());
+        }
+        if self.server.batch_size == 0 {
+            return Err("batch_size must be greater than 0".into());
+        }
+        if self.server.port == 0 {
+            return Err("port must be greater than 0".into());
+        }
+        
+        // Eviction config validation
+        if self.memory.max_memory > 0 && self.memory.eviction_sample_size == 0 {
+            return Err("eviction_sample_size must be > 0 when max_memory is set".into());
+        }
+        
+        // TLS config validation
+        if self.security.tls_enabled {
+            if self.security.tls_cert_path.is_empty() {
+                return Err("tls_cert_path is required when TLS is enabled".into());
+            }
+            if self.security.tls_key_path.is_empty() {
+                return Err("tls_key_path is required when TLS is enabled".into());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -384,9 +422,11 @@ impl ShardedStore {
         hash as usize % self.num_shards
     }
 
+    /// Set a key-value pair. Returns the old entry's size if it existed (for memory tracking).
     #[inline(always)]
-    fn set(&self, key: Bytes, value: Bytes, ttl: Option<u64>, now: u64) {
+    fn set(&self, key: Bytes, value: Bytes, ttl: Option<u64>, now: u64) -> Option<usize> {
         let expiry = ttl.map(|s| now + s);
+        let key_len = key.len();
         let shard = &self.shards[self.hash(&key)];
         
         // Skip LRU timestamp update 90% of the time for better write performance
@@ -397,7 +437,8 @@ impl ShardedStore {
             0  // Use 0 to skip atomic update, will be updated on read if needed
         };
         
-        shard.insert(
+        // insert() returns the old value atomically - no race condition
+        let old_entry = shard.insert(
             key,
             Entry {
                 value,
@@ -405,6 +446,9 @@ impl ShardedStore {
                 last_accessed: AtomicU32::new(timestamp),
             },
         );
+        
+        // Return old entry size for memory tracking
+        old_entry.map(|e| entry_size(key_len, e.value.len()))
     }
 
     #[inline(always)]
@@ -419,12 +463,14 @@ impl ShardedStore {
                     let key_len = key.len();
                     let value_len = entry.value.len();
                     drop(entry);
-                    shard.remove(key);
                     
-                    // Decrement memory tracking
-                    if CONFIG.memory.max_memory > 0 {
-                        let size = entry_size(key_len, value_len);
-                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    // Only decrement memory if we actually removed the key
+                    // This prevents double-decrement race with eviction
+                    if shard.remove(key).is_some() {
+                        if CONFIG.memory.max_memory > 0 {
+                            let size = entry_size(key_len, value_len);
+                            MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                        }
                     }
                     return None;
                 }
@@ -438,8 +484,9 @@ impl ShardedStore {
         None
     }
 
+    /// Delete keys. Returns (count_deleted, bytes_freed) for memory tracking.
     #[inline(always)]
-    fn delete(&self, keys: &[Bytes]) -> usize {
+    fn delete(&self, keys: &[Bytes]) -> (usize, usize) {
         // Group by shard for efficiency
         let mut shard_keys: Vec<Vec<&Bytes>> = vec![Vec::new(); self.num_shards];
         for key in keys {
@@ -447,17 +494,19 @@ impl ShardedStore {
         }
 
         let mut count = 0;
+        let mut bytes_freed = 0;
         for (idx, keys_in_shard) in shard_keys.iter().enumerate() {
             if !keys_in_shard.is_empty() {
                 let shard = &self.shards[idx];
                 for key in keys_in_shard {
-                    if shard.remove(*key).is_some() {
+                    if let Some((k, entry)) = shard.remove(*key) {
                         count += 1;
+                        bytes_freed += entry_size(k.len(), entry.value.len());
                     }
                 }
             }
         }
-        count
+        (count, bytes_freed)
     }
 
     #[inline(always)]
@@ -524,6 +573,10 @@ impl RespParser {
             match self.try_parse() {
                 Ok(Some(cmd)) => return Ok(cmd),
                 Ok(None) => {
+                    // DoS protection: reject connections with excessively large buffers
+                    if self.buffer.len() > MAX_BUFFER_SIZE {
+                        return Err(());
+                    }
                     if stream.read_buf(&mut self.buffer).await.is_err() {
                         return Err(());
                     }
@@ -971,6 +1024,54 @@ fn evict_random(store: &ShardedStore) -> usize {
     0
 }
 
+// Passive key expiration: scan random keys and remove expired ones
+// This runs in a background task to clean up keys that are never accessed
+fn expire_random_keys(store: &ShardedStore, sample_size: usize) -> usize {
+    let now = get_timestamp();
+    let mut expired_count = 0;
+    
+    for _ in 0..sample_size {
+        // Pick a random shard
+        let shard_idx = fastrand::usize(..store.num_shards);
+        let shard = &store.shards[shard_idx];
+        
+        // Check first entry in the shard
+        if let Some(entry) = shard.iter().next() {
+            if let Some(expiry) = entry.value().expiry {
+                if now >= expiry {
+                    let key = entry.key().clone();
+                    let key_len = key.len();
+                    let value_len = entry.value().value.len();
+                    drop(entry);
+                    
+                    // Remove expired key
+                    if shard.remove(&key).is_some() {
+                        expired_count += 1;
+                        if CONFIG.memory.max_memory > 0 {
+                            let size = entry_size(key_len, value_len);
+                            MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    expired_count
+}
+
+// Background task for passive key expiration
+async fn expiration_task(store: ShardedStore) {
+    // Run every 100ms, check 20 random keys per iteration
+    // This is similar to Redis's passive expiration strategy
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    
+    loop {
+        interval.tick().await;
+        expire_random_keys(&store, 20);
+    }
+}
+
 // Execute command - fully inlined and optimized
 #[inline(always)]
 fn execute_command(
@@ -1032,12 +1133,12 @@ fn execute_command(
                     if command.len() >= 5 && command[3].len() == 2 {
                         let ex = &command[3];
                         if (ex[0] | 0x20) == b'e' && (ex[1] | 0x20) == b'x' {
-                            // Parse TTL strictly - error on invalid format
+                            // Parse TTL strictly - error on invalid format or overflow
                             let ttl_bytes = &command[4];
                             let mut val = 0u64;
                             let mut valid = true;
                             
-                            // Check all bytes are digits
+                            // Check all bytes are digits with overflow protection
                             if ttl_bytes.is_empty() {
                                 valid = false;
                             } else {
@@ -1046,7 +1147,14 @@ fn execute_command(
                                         valid = false;
                                         break;
                                     }
-                                    val = val * 10 + (b - b'0') as u64;
+                                    // Use checked arithmetic to prevent overflow
+                                    match val.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as u64)) {
+                                        Some(new_val) => val = new_val,
+                                        None => {
+                                            valid = false;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             
@@ -1059,26 +1167,14 @@ fn execute_command(
                         }
                     }
 
-                    // Check if key exists (for memory tracking on overwrites)
-                    let old_size = if CONFIG.memory.max_memory > 0 {
-                        let shard_idx = store.hash(key);
-                        let shard = &store.shards[shard_idx];
-                        if let Some(old_entry) = shard.get(key) {
-                            entry_size(key.len(), old_entry.value.len())
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-
-                    store.set(key.clone(), value.clone(), ttl, now);
+                    // Atomic set - returns old entry size if key existed (no race condition)
+                    let old_size = store.set(key.clone(), value.clone(), ttl, now);
 
                     // Track memory usage (only if limits enabled)
                     if CONFIG.memory.max_memory > 0 {
-                        // Subtract old, add new
-                        if old_size > 0 {
-                            MEMORY_USED.fetch_sub(old_size as u64, Ordering::Relaxed);
+                        // Subtract old size (if key existed), add new size
+                        if let Some(old) = old_size {
+                            MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
                         }
                         MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
                     }
@@ -1102,7 +1198,11 @@ fn execute_command(
             }
             if eq_ignore_case_3(cmd, b"del") {
                 if command.len() >= 2 {
-                    let count = store.delete(&command[1..]);
+                    let (count, bytes_freed) = store.delete(&command[1..]);
+                    // Track memory freed (only if limits enabled)
+                    if CONFIG.memory.max_memory > 0 && bytes_freed > 0 {
+                        MEMORY_USED.fetch_sub(bytes_freed as u64, Ordering::Relaxed);
+                    }
                     writer.write_integer(count);
                 } else {
                     writer.write_error(b"wrong number of arguments");
@@ -1124,7 +1224,11 @@ fn execute_command(
                 // AUTH command
                 if !CONFIG.security.password.is_empty() {
                     if command.len() >= 2 {
-                        if command[1].as_ref() == CONFIG.security.password.as_bytes() {
+                        // Use constant-time comparison to prevent timing attacks
+                        let provided = command[1].as_ref();
+                        let expected = CONFIG.security.password.as_bytes();
+                        let is_valid = provided.ct_eq(expected).into();
+                        if is_valid {
                             state.authenticated = true;
                             writer.write_simple_string(b"OK");
                         } else {
@@ -1233,6 +1337,7 @@ fn execute_command(
                 ];
                 if &lower == b"flushdb" {
                     store.clear();
+                    MEMORY_USED.store(0, Ordering::Relaxed);
                     writer.write_simple_string(b"OK");
                     return;
                 }
@@ -1351,11 +1456,31 @@ async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
     let mut writer = RespWriter::new();
     let mut state = ConnectionState::new();
     let mut batch_count = 0;
+    
+    // Connection idle timeout (0 = disabled)
+    let timeout_duration = if CONFIG.server.connection_timeout > 0 {
+        Some(Duration::from_secs(CONFIG.server.connection_timeout))
+    } else {
+        None
+    };
 
     loop {
         let now = get_timestamp();
 
-        match parser.parse_command(&mut stream).await {
+        // Apply idle timeout if configured
+        let parse_result = if let Some(timeout) = timeout_duration {
+            match tokio::time::timeout(timeout, parser.parse_command(&mut stream)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Timeout - close idle connection
+                    break;
+                }
+            }
+        } else {
+            parser.parse_command(&mut stream).await
+        };
+
+        match parse_result {
             Ok(command) => {
                 execute_command(&store, &command, &mut writer, &mut state, now);
                 batch_count += 1;
@@ -1414,7 +1539,7 @@ async fn handle_health_check(
 
 // Start health check HTTP server
 async fn start_health_check_server(port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -1572,6 +1697,12 @@ async fn main() {
             start_health_check_server(health_port).await;
         });
     }
+
+    // Start passive key expiration background task
+    let expiration_store = store.clone();
+    tokio::spawn(async move {
+        expiration_task(expiration_store).await;
+    });
 
     println!();
 

@@ -1,6 +1,6 @@
 [package]
 name = "redistill"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 authors = ["Shahid Shaikh"]
 description = "High-performance Redis-compatible key-value store that outperforms Redis"
@@ -26,6 +26,7 @@ fastrand = "2"
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
+subtle = "2"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"
