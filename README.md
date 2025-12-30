@@ -22,12 +22,12 @@ Redistill is a drop-in Redis replacement optimized for high-performance caching 
 
 ## Why Redistill?
 
-✅ **Maximum Performance** - 4.5x faster than Redis, 1.7x faster than Dragonfly  
-✅ **Lower Latency** - Sub-millisecond p50 latency (0.48ms)  
-✅ **Cost Efficient** - 50-83% infrastructure savings  
-✅ **Drop-in Compatible** - Works with existing Redis clients  
-✅ **Production Ready** - TLS, authentication, monitoring, health checks  
-✅ **Multi-threaded** - Utilizes all CPU cores efficiently  
+- **Maximum Performance** - 4.5x faster than Redis, 1.7x faster than Dragonfly  
+- **Lower Latency** - Sub-millisecond p50 latency (0.48ms)  
+- **Cost Efficient** - 50-83% infrastructure savings  
+- **Drop-in Compatible** - Works with existing Redis clients  
+- **Production Ready** - TLS, authentication, monitoring, health checks  
+- **Multi-threaded** - Utilizes all CPU cores efficiently  
 
 ## Quick Start
 
@@ -134,7 +134,7 @@ Redistill   ██████████████████████�
 
 ## Use Cases
 
-### ✅ Perfect For
+### Perfect For
 
 **Session Storage**
 - 1M+ operations/second
@@ -160,13 +160,13 @@ Redistill   ██████████████████████�
 - Can rebuild from database
 - Sub-millisecond queries
 
-### ⚠️ Not Recommended For
+### Not Recommended For
 
 - **Persistent data storage** (no disk persistence)
 - **Financial or transactional data** (data lost on restart)
 - **Data that cannot be regenerated** (use a database)
 
-> 📖 For code examples and patterns, see [Practical Examples](docs/EXAMPLES.md).
+> For code examples and patterns, see [Practical Examples](docs/EXAMPLES.md).
 
 ## Cost Analysis
 
@@ -413,16 +413,16 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | License | MIT | BSL | BSD |
 
 **When to Use Redistill:**
-- ✅ High-performance caching (session storage, API responses)
-- ✅ Read-heavy workloads (70%+ reads)
-- ✅ Ephemeral data that can be regenerated
-- ✅ Maximum throughput and minimum latency
+- High-performance caching (session storage, API responses)
+- Read-heavy workloads (70%+ reads)
+- Ephemeral data that can be regenerated
+- Maximum throughput and minimum latency
 
 **When to Use Redis/Dragonfly:**
-- ✅ Need persistence (data must survive restarts)
-- ✅ Need replication and clustering
-- ✅ Complex data structures required
-- ✅ Established ecosystem and tooling critical
+- Need persistence (data must survive restarts)
+- Need replication and clustering
+- Complex data structures required
+- Established ecosystem and tooling critical
 
 ## Contributing
 
