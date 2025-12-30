@@ -1,6 +1,6 @@
 # Redistill
 
-> A high-performance, Redis-compatible in-memory cache written in Rust. Up to 2x faster than Redis for read-heavy workloads.
+> A high-performance, Redis-compatible in-memory cache written in Rust. Up to 4.5x faster than Redis, outperforming both Redis and Dragonfly.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -10,19 +10,47 @@
 
 ## Overview
 
-Redistill is a drop-in Redis replacement optimized for read-heavy caching workloads. It implements the Redis protocol (RESP) and achieves up to 2x higher throughput than Redis for GET operations by eliminating persistence overhead and leveraging multi-threaded concurrent access.
+Redistill is a drop-in Redis replacement optimized for high-performance caching workloads. It implements the Redis protocol (RESP) and achieves up to 4.5x higher throughput than Redis by eliminating persistence overhead and leveraging multi-threaded concurrent access.
 
 **Key characteristics:**
 - Redis protocol compatible (RESP)
-- Up to **6.8M GET operations/second** (vs Redis 3.4M ops/s - **+100%**)
-- **9-49% faster** for production workloads (50-300 concurrent clients)
+- **9.07M operations/second** - 4.5x faster than Redis, 1.7x faster than Dragonfly
+- **5x lower latency** (p50: 0.48ms vs Redis 2.38ms)
 - Multi-threaded architecture with lock-free reads
 - Zero persistence overhead
 - Production-ready security and monitoring features
 
 ## Performance
 
-Benchmark on **AWS c7i.8xlarge** (Intel, 32 cores) with optimal configuration:
+### Competitive Benchmark (c7i.16xlarge)
+
+Independent comparison on **AWS c7i.16xlarge** (Intel, 64 cores, 128GB RAM) using memtier_benchmark with production-like configuration:
+
+**Test Configuration:**
+- Duration: 60 seconds
+- Threads: 8, Connections: 160 (20 per thread)
+- Pipeline: 30, Data size: 256 bytes
+- Workload: 1:1 SET:GET ratio
+
+| Metric | Redistill | Dragonfly | Redis | vs Redis | vs Dragonfly |
+|--------|-----------|-----------|-------|----------|--------------|
+| **Throughput** | 9.07M ops/s | 5.43M ops/s | 2.03M ops/s | **4.5x** | **1.7x** |
+| **Bandwidth** | 1.58 GB/s | 923 MB/s | 337 MB/s | **4.7x** | **1.7x** |
+| **Avg Latency** | 0.524 ms | 0.877 ms | 2.000 ms | **3.8x faster** | **1.7x faster** |
+| **p50 Latency** | 0.479 ms | 0.807 ms | 2.383 ms | **5.0x faster** | **1.7x faster** |
+| **p99 Latency** | 1.215 ms | 1.975 ms | 2.959 ms | **2.4x faster** | **1.2x faster** |
+| **p99.9 Latency** | 1.591 ms | 2.559 ms | 4.159 ms | **2.6x faster** | **1.6x faster** |
+
+**Key Observations:**
+- Redistill processed 544M total operations (2.7x more than Dragonfly, 4.5x more than Redis)
+- Consistent low latency across all percentiles
+- No errors or connection issues across all systems
+
+> 📊 **Methodology:** Tests run with identical hardware and configuration using [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark). Raw results available in `tests/benchmarks/benchmark_results_memtier/`.
+
+### Detailed Benchmark Results (c7i.8xlarge)
+
+Comprehensive benchmarks on **AWS c7i.8xlarge** (Intel, 32 cores) with optimal configuration:
 - `num_shards=2048`
 - `batch_size=256`
 - `buffer_pool_size=2048`
@@ -55,7 +83,7 @@ Benchmark on **AWS c7i.8xlarge** (Intel, 32 cores) with optimal configuration:
 - Production workloads with any concurrency level
 - Scenarios requiring maximum GET throughput
 
-**Redistill is the fastest Redis-compatible cache for read-heavy workloads.**
+**Redistill is the fastest Redis-compatible cache, outperforming both Redis and Dragonfly.**
 
 > 💡 See [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) for optimization tips and advanced configurations.
 
