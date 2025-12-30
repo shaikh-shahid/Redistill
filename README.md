@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/shaikh-shahid/redistill/workflows/CI/badge.svg)](https://github.com/shaikh-shahid/redistill/actions/workflows/ci.yml)
 [![Release](https://github.com/shaikh-shahid/redistill/workflows/Release/badge.svg)](https://github.com/shaikh-shahid/redistill/actions/workflows/release.yml)
-[![Docker](https://img.shields.io/docker/pulls/shahidshaikh/redistill)](https://hub.docker.com/r/shahidshaikh/redistill)
+[![Docker](https://img.shields.io/docker/pulls/shahidontech/redistill)](https://hub.docker.com/r/shahidontech/redistill)
 
 ## Overview
 
