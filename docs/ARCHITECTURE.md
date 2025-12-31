@@ -25,46 +25,7 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Client Connections                       │
-│              (Redis Protocol - RESP Compatible)              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Tokio Async Runtime                       │
-│                   (Multi-threaded Executor)                  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Command Processing Layer                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │ Parser   │→ │ Executor │→ │ Response │→ │ Writer   │   │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Storage Engine (DashMap)                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Shard 0  │  Shard 1  │  ...  │  Shard N           │   │
-│  │  ┌─────┐  │  ┌─────┐  │       │  ┌─────┐          │   │
-│  │  │K→V+T│  │  │K→V+T│  │       │  │K→V+T│          │   │
-│  │  └─────┘  │  └─────┘  │       │  └─────┘          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│          (K=Key, V=Value, T=Timestamp/TTL)                  │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Background Tasks                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │ TTL Cleanup  │  │ LRU Eviction │  │ Stats Update │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└─────────────────────────────────────────────────────────────┘
-```
+![Redistill Architecture](Redistill_Architecture.png "Redistill Architecture")
 
 ## Performance Optimizations
 
@@ -79,11 +40,11 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Nothing. All data lives in memory only.
 
 **Impact:**
-- ✅ Eliminates all disk I/O
-- ✅ No AOF rewriting overhead
-- ✅ No fsync() blocking
-- ✅ Simpler code path for writes
-- ⚠️ Data lost on restart (by design)
+- Eliminates all disk I/O
+- No AOF rewriting overhead
+- No fsync() blocking
+- Simpler code path for writes
+- Data lost on restart (by design)
 
 ### 2. Multi-threaded Architecture
 
@@ -98,10 +59,10 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Work-stealing scheduler for load balancing
 
 **Impact:**
-- ✅ Utilizes all CPU cores
-- ✅ Higher throughput under load
-- ✅ Better resource utilization
-- ⚠️ Slightly higher memory overhead for thread pools
+- Utilizes all CPU cores
+- Higher throughput under load
+- Better resource utilization
+- Slightly higher memory overhead for thread pools
 
 ### 3. Lock-free Reads with DashMap
 
@@ -115,15 +76,15 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Read operations don't block each other
 
 **Impact:**
-- ✅ Concurrent GET operations scale linearly with cores
-- ✅ Minimal contention on different keys
-- ✅ Optimized for read-heavy workloads
-- ⚠️ Slightly higher memory per shard
+- Concurrent GET operations scale linearly with cores
+- Minimal contention on different keys
+- Optimized for read-heavy workloads
+- Slightly higher memory per shard
 
 **Shard Count Impact:**
 ```
 256 shards:   High contention, lower memory
-2048 shards:  Optimal balance ⭐ (Recommended)
+2048 shards:  Optimal balance (Recommended)
 4096 shards:  Maximum GET performance, higher memory
 ```
 
@@ -139,10 +100,10 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - No data copying on reads
 
 **Impact:**
-- ✅ Reduced memory allocations
-- ✅ Faster reads (no memcpy)
-- ✅ Lower GC pressure
-- ✅ Better cache locality
+- Reduced memory allocations
+- Faster reads (no memcpy)
+- Lower GC pressure
+- Better cache locality
 
 ### 5. Batched Writes
 
@@ -156,10 +117,10 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Batched counter updates (256x reduction in atomics)
 
 **Impact:**
-- ✅ Reduced atomic operation overhead
-- ✅ Better CPU cache utilization
-- ✅ Matches Redis performance at extreme concurrency
-- ⚠️ LRU timestamps slightly less accurate (acceptable trade-off)
+- Reduced atomic operation overhead
+- Better CPU cache utilization
+- Matches Redis performance at extreme concurrency
+- LRU timestamps slightly less accurate (acceptable trade-off)
 
 ### 6. Async I/O with Tokio
 
@@ -172,10 +133,10 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Buffered I/O with connection pooling
 
 **Impact:**
-- ✅ Battle-tested async runtime
-- ✅ Efficient syscall management
-- ✅ Better error handling
-- ✅ Future-proof (Tokio improvements benefit Redistill)
+- Battle-tested async runtime
+- Efficient syscall management
+- Better error handling
+- Future-proof (Tokio improvements benefit Redistill)
 
 ## Trade-offs
 
@@ -201,43 +162,43 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 ### When Redistill Excels
 
-✅ **Read-heavy workloads** (70%+ reads)
+**Read-heavy workloads** (70%+ reads)
 - GET operations are 2-4x faster than Redis
 - Lock-free reads scale with cores
 
-✅ **High concurrency** (50-300 clients)
+**High concurrency** (50-300 clients)
 - Multi-threaded architecture shines
 - Better resource utilization
 
-✅ **Pipelined workloads** (P≥16)
+**Pipelined workloads** (P≥16)
 - Batched operations reduce overhead
 - Optimized buffer management
 
-✅ **Medium-large values** (256B-10KB)
+**Medium-large values** (256B-10KB)
 - Zero-copy design benefits larger values
 - Less overhead relative to data size
 
 ### When Redis is Better
 
-⚠️ **Need persistence**
+**Need persistence**
 - Redis has AOF/RDB
 - Redistill loses data on restart
 
-⚠️ **Need replication/clustering**
+**Need replication/clustering**
 - Redis has built-in clustering
 - Redistill requires manual sharding
 
-⚠️ **Complex data structures**
+**Complex data structures**
 - Redis supports Lists, Sets, Hashes, Sorted Sets
 - Redistill only supports strings (KV pairs)
 
-⚠️ **Write-heavy extreme loads** (>50% writes, 500+ clients)
+**Write-heavy extreme loads** (>50% writes, 500+ clients)
 - Redis's single-threaded model can be faster at extreme write concurrency
 - Redistill's multi-threading has coordination overhead
 
 ## Use Cases
 
-### ✅ Perfect For
+### Perfect For
 
 **1. HTTP Session Storage**
 - Read-heavy (sessions read on every request)
@@ -269,7 +230,7 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Occasional updates
 - Low latency critical
 
-### ⚠️ Not Recommended For
+### Not Recommended For
 
 **1. Primary Data Store**
 - Reason: No persistence
@@ -291,17 +252,17 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 | Requirement | Redistill | Redis |
 |-------------|-----------|-------|
-| Maximum throughput | ✅ Best choice | ⚠️ Slower |
-| Lowest latency | ✅ Best choice | ⚠️ Higher p50/p99 |
-| Read-heavy workload (80%+ reads) | ✅ 2-4x faster | ⚠️ Slower |
-| Write-heavy workload (>50% writes) | ⚠️ Good | ✅ Better at extreme scale |
-| Need persistence | ❌ Not supported | ✅ AOF/RDB |
-| Need replication | ❌ Not built-in | ✅ Built-in |
-| Need clustering | ❌ Manual sharding | ✅ Redis Cluster |
-| Complex data types | ❌ Strings only | ✅ Lists, Sets, Hashes, etc. |
-| Drop-in Redis replacement | ✅ For caching | ⚠️ Check feature compatibility |
-| Cost efficiency | ✅ 50-83% savings | ⚠️ Higher costs |
-| Multi-core utilization | ✅ All cores | ⚠️ Single threaded |
+| Maximum throughput | Best choice | Slower |
+| Lowest latency | Best choice | Higher p50/p99 |
+| Read-heavy workload (80%+ reads) | 2-4x faster | Slower |
+| Write-heavy workload (>50% writes) | Good | Better at extreme scale |
+| Need persistence | Not supported | AOF/RDB |
+| Need replication | Not built-in | Built-in |
+| Need clustering | Manual sharding | Redis Cluster |
+| Complex data types | Strings only | Lists, Sets, Hashes, etc. |
+| Drop-in Redis replacement | For caching | Check feature compatibility |
+| Cost efficiency | 50-83% savings | Higher costs |
+| Multi-core utilization | All cores | Single threaded |
 
 ## Technical Implementation Details
 
