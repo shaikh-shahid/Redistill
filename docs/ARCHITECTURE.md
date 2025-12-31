@@ -130,7 +130,7 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 **What Redistill Does:**
 - Tokio for async networking
-- Buffered I/O with connection pooling
+- Buffered I/O with per-connection async tasks
 
 **Impact:**
 - Battle-tested async runtime
@@ -293,33 +293,39 @@ async fn handle_set(key: String, value: Bytes) {
 ```
 Key anatomy in memory:
 ┌────────────────────────────────────────┐
-│ Key (String)                           │  ~32-128 bytes
+│ Key (Bytes)                            │  Variable (key length)
 ├────────────────────────────────────────┤
-│ Value (Bytes - reference counted)      │  Variable
+│ Value (Bytes - reference counted)      │  Variable (value length)
 ├────────────────────────────────────────┤
-│ Timestamp (u64)                        │  8 bytes
+│ Timestamp (u32)                        │  4 bytes (AtomicU32)
 ├────────────────────────────────────────┤
 │ TTL (Option<u64>)                      │  16 bytes
 ├────────────────────────────────────────┤
 │ DashMap overhead                       │  ~32 bytes
+├────────────────────────────────────────┤
+│ Entry struct overhead                  │  ~12 bytes
 └────────────────────────────────────────┘
 
-Total overhead per key: ~100 bytes
+Fixed overhead per key: ~64 bytes
+Total size: key_len + value_len + 64 bytes
 ```
 
 ### Eviction Strategy
 
 **LRU (Least Recently Used):**
 - Probabilistic updates (90% skip rate)
-- Batched timestamp updates
-- Background eviction task
+- On-demand eviction during write operations
 - Configurable memory limit
 
 **Algorithm:**
-1. Check memory usage periodically
-2. If > max_memory, select random samples
-3. Evict keys with oldest timestamp
-4. Continue until memory < max_memory
+1. On SET operation, check if memory limit would be exceeded
+2. If eviction needed, sample random shards (default: 5 samples)
+3. From each shard, examine first entry (effectively random due to hash distribution)
+4. Evict key with oldest `last_accessed` timestamp
+5. Repeat until sufficient memory is freed
+6. If no eviction policy set, reject write with OOM error
+
+**Note:** Eviction is synchronous and happens during write operations, not in a background task. TTL expiration runs separately in a background task every 100ms.
 
 ## Future Roadmap
 
