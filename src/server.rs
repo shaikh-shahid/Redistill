@@ -114,9 +114,7 @@ pub async fn load_tls_config(
 
 // ==================== Health Check Server ====================
 
-async fn health_handler(
-    _req: Request<hyper::body::Incoming>,
-) -> Result<Response<HttpFull<Bytes>>, Infallible> {
+async fn health_response() -> Response<HttpFull<Bytes>> {
     let active = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
     let total_cmds = TOTAL_COMMANDS.load(Ordering::Relaxed);
     let total_conns = TOTAL_CONNECTIONS.load(Ordering::Relaxed);
@@ -127,29 +125,59 @@ async fn health_handler(
         active, total_cmds, total_conns, memory
     );
 
-    let response = Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(HttpFull::new(Bytes::from(status)))
-        .unwrap();
+        .unwrap()
+}
 
-    Ok(response)
+async fn metrics_response(store: &crate::store::ShardedStore) -> Response<HttpFull<Bytes>> {
+    let body = crate::metrics::encode(store);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(HttpFull::new(Bytes::from(body)))
+        .unwrap()
+}
+
+async fn not_found() -> Response<HttpFull<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(HttpFull::new(Bytes::from_static(b"not found\n")))
+        .unwrap()
+}
+
+/// Dispatch by path. Unknown paths return 404; only GET is supported but we
+/// don't reject other methods explicitly — Prometheus-side scrapers always
+/// GET, so we keep the handler permissive.
+async fn http_router(
+    req: Request<hyper::body::Incoming>,
+    store: crate::store::ShardedStore,
+) -> Result<Response<HttpFull<Bytes>>, Infallible> {
+    let resp = match req.uri().path() {
+        "/health" | "/" => health_response().await,
+        "/metrics" => metrics_response(&store).await,
+        _ => not_found().await,
+    };
+    Ok(resp)
 }
 
 pub async fn start_health_check_server(
     port: u16,
+    store: crate::store::ShardedStore,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Failed to start health check server on {}: {}", addr, e);
+            tracing::error!(error = %e, %addr, "failed to start health check server");
             return;
         }
     };
 
-    println!("Health check endpoint: http://{}/health", addr);
+    tracing::info!(%addr, "health + metrics endpoints listening (/health, /metrics)");
 
     loop {
         let (stream, _) = tokio::select! {
@@ -162,13 +190,12 @@ pub async fn start_health_check_server(
         };
 
         let io = TokioIo::new(stream);
+        let store = store.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(io, service_fn(health_handler))
-                .await
-            {
-                eprintln!("Health check connection error: {}", e);
+            let svc = service_fn(move |req| http_router(req, store.clone()));
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                tracing::warn!(error = %e, "health check connection error");
             }
         });
     }

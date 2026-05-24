@@ -157,19 +157,52 @@
 
 ### Monitoring and Observability
 
-**Metrics Tracked**:
-- Total connections (lifetime)
-- Active connections (current)
-- Rejected connections
-- Total commands processed
-- Memory usage
-- Evicted keys
-- Server uptime
+Three independent access surfaces, all backed by the same internal state:
 
-**Access Methods**:
-- `INFO` command (Redis protocol)
-- HTTP health endpoint (JSON)
-- Real-time statistics
+**1. Prometheus `/metrics`** — text exposition on `server.health_check_port`. Drop-in scrape target.
+
+| Metric | Type | Labels | Notes |
+|--------|------|--------|-------|
+| `redistill_commands_total` | counter | `cmd` | Per-command success counter. **Opt-in** via `metrics.command_counter`. |
+| `redistill_command_duration_seconds` | histogram | `cmd` | Latency histogram. **Opt-in** via `metrics.command_histogram` (also needs `command_counter`). |
+| `redistill_commands_dispatched_total` | counter | — | Mirrors the `TOTAL_COMMANDS` atomic (always on) |
+| `redistill_connections_active` | gauge | — | Current open connections |
+| `redistill_connections_total` | counter | — | Lifetime connections accepted |
+| `redistill_rejected_connections_total` | counter | — | Hit `max_connections` or rate limit |
+| `redistill_memory_used_bytes` | gauge | — | Bytes resident in the store |
+| `redistill_evicted_keys_total` | counter | — | Keys evicted by the eviction policy |
+| `redistill_keys_total` | gauge | — | Live keys (scrape-time count) |
+| `redistill_aof_size_bytes` | gauge | — | Current AOF size (-1 if AOF disabled) |
+| `redistill_aof_last_rewrite_size_bytes` | gauge | — | Size after most recent rewrite |
+| `redistill_aof_dirty` | gauge | — | 1 if AOF has unsynced writes |
+| `redistill_aof_appends_total` | counter | — | Commands appended to the AOF |
+| `redistill_aof_rewrites_total` | counter | — | AOF rewrites completed |
+| `redistill_aof_replay_commands_total` | counter | — | Commands replayed at startup |
+| `redistill_build_info` | gauge | `version` | Always 1; identity series |
+
+The `cmd` label uses a fixed allowlist of command names so cardinality is bounded. Unknown commands bucket into `cmd="other"`.
+
+**Why per-command metrics are opt-in:** at multi-million-rps pipelined write workloads, contention on a single per-label atomic counter is the dominant cost (we measured ~30–50% throughput drop on SET P=128 with the counter on). Enable when you need per-command visibility; leave off for raw throughput.
+
+**2. HTTP `/health`** — JSON status, same port:
+```json
+{"status":"healthy","active_connections":4,"total_commands":12345,"total_connections":80,"memory_used":4096000}
+```
+Suitable for load-balancer / Kubernetes liveness + readiness probes.
+
+**3. `INFO` command** — Redis-protocol summary for `redis-cli` and Redis-aware tools.
+
+### Structured Logging
+
+All internal diagnostics go through `tracing`. Configure via `logging.level` and `logging.format` in `redistill.toml`, or override with `RUST_LOG` env var.
+
+- `logging.format = "text"` (default) — compact human-readable lines on stdout
+- `logging.format = "json"` — one JSON object per line; pipe into Loki, Datadog, Splunk, etc
+
+Sample JSON record:
+```json
+{"timestamp":"2026-05-23T12:34:56.789Z","level":"INFO","fields":{"message":"AOF rewrite complete","keys":1024,"bytes_written":98304}}
+```
 
 ### Persistence (Optional)
 

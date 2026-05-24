@@ -423,15 +423,44 @@ client.Set(ctx, "key", "value", 0)
 ## Monitoring
 
 ```bash
-# Health check (HTTP)
+# Health check (HTTP, JSON)
 curl http://localhost:8080/health
 
-# Server statistics
+# Prometheus metrics (text exposition; scrape from same port as /health)
+curl http://localhost:8080/metrics
+
+# Server statistics (via Redis protocol)
 redis-cli INFO
 
 # Check memory usage
 redis-cli INFO memory
 ```
+
+**Prometheus scrape config:**
+
+```yaml
+scrape_configs:
+  - job_name: redistill
+    static_configs:
+      - targets: ['localhost:8080']
+```
+
+Exposed metrics include gauges/counters for memory, connections, eviction, AOF
+size, AOF dirty, AOF appends/rewrites, replay commands, and a
+`redistill_build_info{version=…}` identity series — all always-on and free on
+the hot path.
+
+Per-command instrumentation (`redistill_commands_total{cmd=…}` counter and
+`redistill_command_duration_seconds{cmd=…}` histogram) is **opt-in** via the
+`metrics.command_counter` and `metrics.command_histogram` flags. Atomic
+contention on a single counter per label dominates write-heavy pipelined
+workloads (~30–50% throughput drop on SET P=128). Turn them on when you
+need per-command visibility and accept the cost; leave them off for raw
+throughput.
+
+**Structured logs:** All diagnostics go through `tracing`. Set
+`logging.format = "json"` (or env `RUST_LOG=…`) for JSON-formatted log
+records on stdout — ready to ship into Loki, Datadog, Splunk, etc.
 
 ## Documentation
 

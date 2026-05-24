@@ -276,7 +276,10 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
     }
 
     if skipped_expired > 0 {
-        eprintln!("(skipped {} expired keys during load)", skipped_expired);
+        tracing::info!(
+            skipped = skipped_expired,
+            "skipped expired keys during RDB load"
+        );
     }
 
     Ok(loaded)
@@ -310,13 +313,10 @@ pub async fn snapshot_task(
         tokio::task::spawn_blocking(
             move || match save_snapshot_sync(&store_clone, &path_clone) {
                 Ok(count) => {
-                    eprintln!(
-                        "Background snapshot saved: {} keys to {}",
-                        count, path_clone
-                    );
+                    tracing::info!(keys = count, path = %path_clone, "background snapshot saved");
                 }
                 Err(e) => {
-                    eprintln!("Background snapshot failed: {}", e);
+                    tracing::error!(error = %e, "background snapshot failed");
                 }
             },
         );

@@ -375,12 +375,46 @@ Monitor these metrics continuously:
 
 ### Monitoring Tools Integration
 
-**Prometheus** (requires exporter - not built-in):
+**Prometheus** (built-in `/metrics` endpoint on the health-check port):
 ```yaml
 scrape_configs:
   - job_name: 'redistill'
+    metrics_path: /metrics
     static_configs:
       - targets: ['redistill:8080']
+```
+
+Useful alert rules:
+
+```yaml
+groups:
+- name: redistill
+  rules:
+  - alert: RedistillHighEvictionRate
+    expr: rate(redistill_evicted_keys_total[5m]) > 100
+    for: 10m
+    labels: { severity: warning }
+    annotations:
+      summary: "Redistill evicting > 100 keys/sec for 10 min — increase max_memory or revisit cache strategy"
+
+  - alert: RedistillRejectingConnections
+    expr: increase(redistill_rejected_connections_total[5m]) > 0
+    for: 5m
+    labels: { severity: warning }
+
+  - alert: RedistillAOFDirty
+    expr: redistill_aof_dirty == 1 and changes(redistill_aof_dirty[10m]) == 0
+    for: 10m
+    labels: { severity: critical }
+    annotations:
+      summary: "AOF has been dirty for 10 minutes — everysec fsync may be failing"
+
+  - alert: RedistillCommandLatencyHigh
+    expr: histogram_quantile(0.99, sum(rate(redistill_command_duration_seconds_bucket[5m])) by (le, cmd)) > 0.01
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "p99 command latency > 10ms for {{ $labels.cmd }}"
 ```
 
 **Datadog** (custom check):

@@ -123,6 +123,7 @@ impl Aof {
         }
         drop(w);
         self.size_bytes.fetch_add(written as u64, Ordering::Relaxed);
+        crate::metrics::AOF_APPENDS_TOTAL.inc();
         Ok(())
     }
 
@@ -244,6 +245,7 @@ impl Aof {
         self.last_rewrite_size
             .store(bytes_written, Ordering::Relaxed);
         self.dirty.store(false, Ordering::Relaxed);
+        crate::metrics::AOF_REWRITES_TOTAL.inc();
 
         Ok(RewriteStats {
             keys_written,
@@ -497,13 +499,15 @@ pub async fn rewrite_supervisor_task(
                     tokio::task::spawn_blocking(move || {
                         match aof_c.rewrite(&store_c) {
                             Ok(Some(stats)) => {
-                                eprintln!(
-                                    "AOF auto-rewrite: {} keys, {} -> {} bytes",
-                                    stats.keys_written, stats.previous_bytes, stats.bytes_written
+                                tracing::info!(
+                                    keys = stats.keys_written,
+                                    previous_bytes = stats.previous_bytes,
+                                    bytes_written = stats.bytes_written,
+                                    "AOF auto-rewrite complete"
                                 );
                             }
                             Ok(None) => {} // another rewrite got there first
-                            Err(e) => eprintln!("AOF auto-rewrite failed: {}", e),
+                            Err(e) => tracing::error!(error = %e, "AOF auto-rewrite failed"),
                         }
                     });
                 }
@@ -526,7 +530,7 @@ pub async fn everysec_task(aof: Arc<Aof>, mut shutdown_rx: tokio::sync::watch::R
                     let a = aof.clone();
                     let res = tokio::task::spawn_blocking(move || a.sync()).await;
                     if let Ok(Err(e)) = res {
-                        eprintln!("AOF everysec fsync failed: {}", e);
+                        tracing::error!(error = %e, "AOF everysec fsync failed");
                     }
                 }
             }
@@ -535,6 +539,6 @@ pub async fn everysec_task(aof: Arc<Aof>, mut shutdown_rx: tokio::sync::watch::R
     // One last sync so any buffered writes after the final tick still land.
     let final_sync = tokio::task::spawn_blocking(move || aof.sync()).await;
     if let Ok(Err(e)) = final_sync {
-        eprintln!("AOF shutdown sync failed: {}", e);
+        tracing::error!(error = %e, "AOF shutdown sync failed");
     }
 }

@@ -104,6 +104,33 @@ pub struct PersistenceConfig {
     pub aof_rewrite_percentage: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable per-command Prometheus instrumentation (`redistill_commands_total{cmd}`
+    /// counter and, if `command_histogram` is also true, the matching latency
+    /// histogram). Off by default — at multi-million-rps pipelined workloads
+    /// the contention on a single per-label atomic counter is the dominant
+    /// cost. All other metrics (AOF, eviction, connections, memory) are
+    /// always on and cheap because they only update on already-rare events
+    /// or are read at scrape time.
+    #[serde(default)]
+    pub command_counter: bool,
+    /// Additionally record per-command latency in a histogram. Requires
+    /// `command_counter = true`. Costs roughly 2× the bare counter due to
+    /// two `Instant::now()` calls and an atomic bucket update.
+    #[serde(default)]
+    pub command_histogram: bool,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            command_counter: false,
+            command_histogram: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -118,6 +145,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 // ==================== Default Functions ====================
@@ -306,7 +335,7 @@ impl Config {
             toml::from_str(&contents)?
         } else {
             if config_path != "redistill.toml" {
-                eprintln!("Config file '{}' not found, using defaults", config_path);
+                tracing::warn!(path = %config_path, "config file not found, using defaults");
             }
             Config::default()
         };
@@ -428,6 +457,14 @@ impl Config {
             && let Ok(v) = s.parse()
         {
             config.persistence.aof_rewrite_percentage = v;
+        }
+
+        if let Ok(v) = std::env::var("REDIS_METRICS_COMMAND_COUNTER") {
+            config.metrics.command_counter = v.parse().unwrap_or(false);
+        }
+
+        if let Ok(v) = std::env::var("REDIS_METRICS_COMMAND_HISTOGRAM") {
+            config.metrics.command_histogram = v.parse().unwrap_or(false);
         }
 
         config.validate()?;

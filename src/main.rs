@@ -14,6 +14,7 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod aof;
 mod config;
+mod metrics;
 mod persistence;
 mod protocol;
 mod server;
@@ -65,13 +66,35 @@ fn aof_log(command: &[Bytes]) {
         // AOF write errors are a durability incident but not fatal — a running
         // cache is better than a dead one. Surface loudly; future work: track
         // a counter and expose via INFO.
-        eprintln!("AOF append failed: {}", e);
+        tracing::error!(error = %e, "AOF append failed");
     }
 }
 
 // Thread-local command counter for batching updates
 thread_local! {
     static LOCAL_CMD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// ==================== Tracing setup ====================
+
+/// Initialise the global tracing subscriber. Idempotent; safe to call twice
+/// (the second call is a no-op because `try_init` returns Err).
+fn init_tracing(level: &str, format: &str) {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    // Honour RUST_LOG if present; otherwise fall back to config-supplied level.
+    let env_filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => EnvFilter::new(format!("redistill={},warn", level)),
+    };
+
+    let json = format.eq_ignore_ascii_case("json");
+    let builder = fmt().with_env_filter(env_filter).with_target(false);
+    if json {
+        let _ = builder.json().try_init();
+    } else {
+        let _ = builder.try_init();
+    }
 }
 
 // ==================== Shutdown Signal ====================
@@ -84,7 +107,7 @@ async fn shutdown_signal() {
     let mut term = match unix_signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to install SIGTERM handler: {}", e);
+            tracing::error!(error = %e, "failed to install SIGTERM handler");
             // Fall back to SIGINT only so the server can still be stopped.
             std::future::pending::<()>().await;
             return;
@@ -93,7 +116,7 @@ async fn shutdown_signal() {
     let mut intr = match unix_signal(SignalKind::interrupt()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to install SIGINT handler: {}", e);
+            tracing::error!(error = %e, "failed to install SIGINT handler");
             std::future::pending::<()>().await;
             return;
         }
@@ -107,7 +130,7 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     if let Err(e) = signal::ctrl_c().await {
-        eprintln!("Failed to install ctrl_c handler: {}", e);
+        tracing::error!(error = %e, "failed to install ctrl_c handler");
     }
 }
 
@@ -151,6 +174,25 @@ fn execute_command(
     }
 
     let cmd = &command[0];
+
+    // Per-command Prometheus instrumentation. Both checks read static
+    // AtomicBools set once at startup (see `metrics::init_runtime_flags`),
+    // NOT `CONFIG.deref()`, because the Lazy<Config> state-load adds enough
+    // shared-cache-line contention at multi-million-rps to be measurable.
+    // When both are false the entire block compiles to an early branch that
+    // the optimizer drops cleanly.
+    let _timer = if metrics::command_counter_enabled() {
+        let label = metrics::command_label(cmd);
+        let m = metrics::command_metrics(label);
+        m.counter.inc();
+        if metrics::command_histogram_enabled() {
+            Some(m.duration.start_timer())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // AUTH and PING don't require authentication
     let requires_auth = !matches!(cmd.len(), 4 if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h')
@@ -213,7 +255,7 @@ fn execute_command(
                 }
                 match save_snapshot_sync(store, &CONFIG.persistence.snapshot_path) {
                     Ok(count) => {
-                        eprintln!("Snapshot saved: {} keys", count);
+                        tracing::info!(keys = count, "snapshot saved");
                         writer.write_simple_string(b"OK");
                     }
                     Err(e) => writer.write_error(e.as_bytes()),
@@ -310,10 +352,10 @@ fn execute_command(
                     SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
                     match save_snapshot_sync(&store_clone, &path) {
                         Ok(count) => {
-                            eprintln!("Background snapshot saved: {} keys", count);
+                            tracing::info!(keys = count, "background snapshot saved");
                         }
                         Err(e) => {
-                            eprintln!("Background snapshot failed: {}", e);
+                            tracing::error!(error = %e, "background snapshot failed");
                         }
                     }
                 });
@@ -529,12 +571,14 @@ fn handle_bgrewriteaof(store: &ShardedStore, writer: &mut RespWriter) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn_blocking(move || match aof_c.rewrite(&store_c) {
-                Ok(Some(stats)) => eprintln!(
-                    "AOF rewrite: {} keys, {} -> {} bytes",
-                    stats.keys_written, stats.previous_bytes, stats.bytes_written
+                Ok(Some(stats)) => tracing::info!(
+                    keys = stats.keys_written,
+                    previous_bytes = stats.previous_bytes,
+                    bytes_written = stats.bytes_written,
+                    "AOF rewrite complete"
                 ),
                 Ok(None) => {} // concurrent rewrite won the race
-                Err(e) => eprintln!("AOF rewrite failed: {}", e),
+                Err(e) => tracing::error!(error = %e, "AOF rewrite failed"),
             });
             writer.write_simple_string(b"Background append only file rewriting started");
         }
@@ -1360,6 +1404,18 @@ async fn main() {
     // Force config initialization
     let config = &*CONFIG;
 
+    // Initialise tracing subscriber. Honour RUST_LOG when set; otherwise use
+    // `logging.level` from config. Output is JSON when `logging.format = "json"`,
+    // else a compact human-readable text format.
+    init_tracing(&config.logging.level, &config.logging.format);
+
+    // Snapshot the metrics enable flags into static atomics so the hot path
+    // doesn't deref `Lazy<Config>` on every command.
+    metrics::init_runtime_flags(
+        config.metrics.command_counter,
+        config.metrics.command_histogram,
+    );
+
     // Initialize store
     let store = ShardedStore::new(config.server.num_shards);
 
@@ -1446,8 +1502,7 @@ async fn main() {
             Ok(0) => println!("no snapshot found"),
             Ok(count) => println!("loaded {} keys", count),
             Err(e) => {
-                eprintln!("failed: {}", e);
-                eprintln!("Starting with empty database");
+                tracing::error!(error = %e, "RDB snapshot load failed; starting with empty database");
             }
         }
     }
@@ -1458,7 +1513,7 @@ async fn main() {
         let fsync_policy = match aof::FsyncPolicy::parse(&config.persistence.aof_fsync) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("AOF config error: {}", e);
+                tracing::error!(error = %e, "AOF config error");
                 std::process::exit(1);
             }
         };
@@ -1488,12 +1543,14 @@ async fn main() {
                                 replay_now,
                             );
                             replayed += 1;
+                            metrics::AOF_REPLAY_COMMANDS_TOTAL.inc();
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            eprintln!("\nAOF malformed after {} commands: {}", replayed, e);
-                            eprintln!(
-                                "Refusing to start with a corrupt AOF. Fix the file or remove it."
+                            tracing::error!(
+                                error = %e,
+                                replayed,
+                                "AOF malformed; refusing to start with a corrupt AOF (fix the file or remove it)"
                             );
                             std::process::exit(1);
                         }
@@ -1503,7 +1560,7 @@ async fn main() {
             }
             Ok(None) => println!("no AOF found"),
             Err(e) => {
-                eprintln!("failed to open AOF: {}", e);
+                tracing::error!(error = %e, "failed to open AOF");
                 std::process::exit(1);
             }
         }
@@ -1512,7 +1569,7 @@ async fn main() {
         match aof::Aof::open(aof_path, fsync_policy) {
             Ok(a) => {
                 if AOF.set(Arc::new(a)).is_err() {
-                    eprintln!("AOF global already initialized (should be impossible)");
+                    tracing::error!("AOF global already initialized (should be impossible)");
                     std::process::exit(1);
                 }
                 println!(
@@ -1522,7 +1579,7 @@ async fn main() {
                 );
             }
             Err(e) => {
-                eprintln!("failed to open AOF for append: {}", e);
+                tracing::error!(error = %e, "failed to open AOF for append");
                 std::process::exit(1);
             }
         }
@@ -1531,7 +1588,7 @@ async fn main() {
     // Load TLS configuration if enabled
     let tls_acceptor = if config.security.tls_enabled {
         if config.security.tls_cert_path.is_empty() || config.security.tls_key_path.is_empty() {
-            eprintln!("TLS enabled but cert/key paths not configured");
+            tracing::error!("TLS enabled but cert/key paths not configured");
             std::process::exit(1);
         }
 
@@ -1548,7 +1605,7 @@ async fn main() {
                 Some(TlsAcceptor::from(tls_config))
             }
             Err(e) => {
-                eprintln!("Failed to load TLS configuration: {}", e);
+                tracing::error!(error = %e, "failed to load TLS configuration");
                 std::process::exit(1);
             }
         }
@@ -1558,7 +1615,7 @@ async fn main() {
 
     let bind_addr = format!("{}:{}", config.server.bind, config.server.port);
     let listener = TcpListener::bind(&bind_addr).await.unwrap_or_else(|e| {
-        eprintln!("Failed to bind to {}: {}", bind_addr, e);
+        tracing::error!(error = %e, addr = %bind_addr, "failed to bind");
         std::process::exit(1);
     });
 
@@ -1594,6 +1651,7 @@ async fn main() {
     if config.server.health_check_port > 0 {
         health_task = Some(tokio::spawn(start_health_check_server(
             config.server.health_check_port,
+            store.clone(),
             shutdown_tx.subscribe(),
         )));
     }
@@ -1683,11 +1741,11 @@ async fn main() {
                                 {
                                     Ok(Ok(tls_stream)) => MaybeStream::Tls(Box::new(tls_stream)),
                                     Ok(Err(e)) => {
-                                        eprintln!("TLS handshake failed: {}", e);
+                                        tracing::warn!(error = %e, "TLS handshake failed");
                                         return;
                                     }
                                     Err(_) => {
-                                        eprintln!("TLS handshake timed out");
+                                        tracing::warn!("TLS handshake timed out");
                                         return;
                                     }
                                 }
@@ -1698,7 +1756,7 @@ async fn main() {
                             handle_connection(stream, store_clone, conn_shutdown_rx).await;
                         });
                     }
-                    Err(e) => eprintln!("Accept error: {}", e),
+                    Err(e) => tracing::warn!(error = %e, "accept error"),
                 }
             }
         }
@@ -1727,10 +1785,10 @@ async fn main() {
         }
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!(
-                "Drain deadline ({:?}) exceeded with {} task(s) still running — aborting",
-                grace,
-                conn_set.len()
+            tracing::warn!(
+                ?grace,
+                in_flight = conn_set.len(),
+                "drain deadline exceeded — aborting in-flight tasks"
             );
             conn_set.abort_all();
             break;
@@ -1779,8 +1837,8 @@ async fn main() {
         let sync_res = tokio::task::spawn_blocking(move || aof_clone.sync()).await;
         match sync_res {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("final AOF sync failed: {}", e),
-            Err(e) => eprintln!("final AOF sync task panicked: {}", e),
+            Ok(Err(e)) => tracing::error!(error = %e, "final AOF sync failed"),
+            Err(e) => tracing::error!(error = %e, "final AOF sync task panicked"),
         }
     }
 
@@ -1796,11 +1854,11 @@ async fn main() {
         });
         match tokio::time::timeout(snapshot_timeout, snapshot).await {
             Ok(Ok(Ok(count))) => println!("saved {} keys", count),
-            Ok(Ok(Err(e))) => eprintln!("failed: {}", e),
-            Ok(Err(join_err)) => eprintln!("snapshot task panicked: {}", join_err),
-            Err(_) => eprintln!(
-                "snapshot exceeded {}s bound — possibly partial write",
-                snapshot_timeout.as_secs()
+            Ok(Ok(Err(e))) => tracing::error!(error = %e, "final snapshot failed"),
+            Ok(Err(join_err)) => tracing::error!(error = %join_err, "snapshot task panicked"),
+            Err(_) => tracing::warn!(
+                bound_secs = snapshot_timeout.as_secs(),
+                "snapshot exceeded bound — possibly partial write"
             ),
         }
     }

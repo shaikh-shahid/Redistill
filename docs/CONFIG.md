@@ -75,7 +75,7 @@ aof_rewrite_percentage = 100
 | `max_connections` | integer | 10000 | Maximum concurrent connections (0 = unlimited) |
 | `connection_timeout` | integer | 300 | Idle connection timeout in seconds (0 = no timeout) |
 | `connection_rate_limit` | integer | 0 | Maximum new connections per second (0 = unlimited) |
-| `health_check_port` | integer | 0 | HTTP health check port (0 = disabled) |
+| `health_check_port` | integer | 0 | HTTP port for `/health` (JSON) and `/metrics` (Prometheus text exposition). 0 = disabled |
 | `shutdown_grace_period_secs` | integer | 30 | Seconds to drain in-flight connections on SIGTERM/SIGINT before force-exit |
 
 ### Security Configuration
@@ -97,10 +97,14 @@ aof_rewrite_percentage = 100
 
 ### Logging Configuration
 
+Logs are emitted via the `tracing` ecosystem. The `RUST_LOG` env var, when set, takes precedence over `level`.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `level` | string | "info" | Log level: error, warn, info, debug, trace |
-| `format` | string | "text" | Log format: text, json |
+| `format` | string | "text" | Log format: `"text"` (human-readable) or `"json"` (one JSON object per line) |
+
+Example: `RUST_LOG=redistill=debug,warn` enables debug-level logging for Redistill and warn for everything else.
 
 ### Performance Configuration
 
@@ -122,6 +126,17 @@ aof_rewrite_percentage = 100
 | `aof_fsync` | string | "everysec" | Fsync policy: `"always"` (per-write), `"everysec"` (1s window), `"no"` (rely on OS) |
 | `aof_rewrite_min_size` | integer | 67108864 | Minimum AOF size (bytes) before auto-rewrite is considered (default: 64 MiB) |
 | `aof_rewrite_percentage` | integer | 100 | Trigger auto-rewrite when log has grown this % past its last-rewrite size (0 = manual only) |
+
+### Metrics Configuration
+
+Prometheus `/metrics` is always served on `server.health_check_port`. AOF, eviction, connection, and memory metrics are always emitted because their hot-path cost is zero (they only fire on rare events or are read at scrape time).
+
+Per-command instrumentation is **opt-in** because contention on a single per-label atomic counter is the dominant cost at multi-million-rps pipelined write workloads (~30-50% throughput drop on SET P=128).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `command_counter` | boolean | false | Emit `redistill_commands_total{cmd=...}` per dispatch |
+| `command_histogram` | boolean | false | Emit `redistill_command_duration_seconds{cmd=...}` per dispatch. Requires `command_counter = true`. |
 
 ## Environment Variables
 
@@ -153,6 +168,8 @@ Environment variables override configuration file settings:
 | `REDIS_AOF_FSYNC` | `persistence.aof_fsync` | `REDIS_AOF_FSYNC=everysec` |
 | `REDIS_AOF_REWRITE_MIN_SIZE` | `persistence.aof_rewrite_min_size` | `REDIS_AOF_REWRITE_MIN_SIZE=67108864` |
 | `REDIS_AOF_REWRITE_PERCENTAGE` | `persistence.aof_rewrite_percentage` | `REDIS_AOF_REWRITE_PERCENTAGE=100` |
+| `REDIS_METRICS_COMMAND_COUNTER` | `metrics.command_counter` | `REDIS_METRICS_COMMAND_COUNTER=true` |
+| `REDIS_METRICS_COMMAND_HISTOGRAM` | `metrics.command_histogram` | `REDIS_METRICS_COMMAND_HISTOGRAM=true` |
 
 ## Example Configurations
 

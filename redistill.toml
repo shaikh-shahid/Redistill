@@ -58,7 +58,7 @@ snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled,
 save_on_shutdown = true           # Save snapshot on graceful shutdown (SIGTERM/Ctrl+C)
 
 # AOF (append-only file, independent of RDB — enable either, both, or neither)
-aof_enabled = true               # Log every write command to an append-only file
+aof_enabled = false              # Log every write command to an append-only file (off by default for max performance)
 aof_path = "redistill.aof"        # Path to AOF file
 aof_fsync = "everysec"            # "always" (per-write, slowest/safest) | "everysec" (default, 1s window) | "no" (rely on OS)
 
@@ -66,4 +66,16 @@ aof_fsync = "everysec"            # "always" (per-write, slowest/safest) | "ever
 # live key so it doesn't grow forever.
 aof_rewrite_min_size = 67108864   # 64 MiB: don't bother rewriting below this
 aof_rewrite_percentage = 100      # rewrite when log is this % larger than after last rewrite (0 = manual only)
+
+[metrics]
+# Prometheus /metrics is always served on health_check_port. AOF/eviction/
+# connection/memory metrics are always on (they only fire on rare events or
+# are read at scrape time, so they have no hot-path cost).
+#
+# Per-command metrics ARE on the hot path. At multi-million-rps pipelined
+# write workloads, contention on a single per-label atomic counter is the
+# dominant cost (~30-50% drop). Turn these on when you need per-command
+# visibility and accept the cost; leave off for raw throughput.
+command_counter = false           # adds redistill_commands_total{cmd=...}
+command_histogram = false         # adds redistill_command_duration_seconds (requires command_counter)
 
