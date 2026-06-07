@@ -113,7 +113,7 @@ fn is_write_command(cmd: &[u8]) -> bool {
     WRITES.iter().any(|w| cmd.eq_ignore_ascii_case(w))
 }
 
-fn spawn_replica_task(store: ShardedStore, host: String, port: u16) {
+fn spawn_replica_task(store: ShardedStore, host: String, port: u16, generation: u64) {
     let r = repl().clone();
     let masterauth = CONFIG.replication.masterauth.clone();
     let listening_port = CONFIG.server.port;
@@ -128,6 +128,7 @@ fn spawn_replica_task(store: ShardedStore, host: String, port: u16) {
             port,
             masterauth,
             listening_port,
+            generation,
             move || clear_store.clear(),
             move |bytes: &[u8]| {
                 if let Err(e) = load_store_from_bytes(&load_store, bytes) {
@@ -292,8 +293,8 @@ fn execute_command(
             writer.write_error(b"REPLICAOF would create a replication cycle to self");
             return;
         }
-        repl().set_master(host.clone(), port);
-        spawn_replica_task(store.clone(), host, port);
+        let generation = repl().set_master(host.clone(), port);
+        spawn_replica_task(store.clone(), host, port, generation);
         writer.write_simple_string(b"OK");
         return;
     }
@@ -1584,8 +1585,8 @@ async fn main() {
             Some((h, p)) => match p.parse::<u16>() {
                 Ok(port) => {
                     let host = h.to_string();
-                    repl().set_master(host.clone(), port);
-                    spawn_replica_task(store.clone(), host, port);
+                    let generation = repl().set_master(host.clone(), port);
+                    spawn_replica_task(store.clone(), host, port, generation);
                     println!("replicating from {}:{}", h, port);
                 }
                 Err(_) => eprintln!("invalid replicaof port: {}", p),

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -48,11 +48,15 @@ pub struct Replication {
     pub barrier: RwLock<()>,
     /// Count of currently connected replicas (for INFO / metrics).
     replica_count: AtomicU64,
+    /// Bumped whenever the master target changes (set_master / promote).
+    /// A replica_client task checks this to detect supersession.
+    gen_tx: watch::Sender<u64>,
 }
 
 impl Replication {
     pub fn new(backlog: usize) -> Self {
         let (sender, _rx) = broadcast::channel(backlog.max(16));
+        let (gen_tx, _gen_rx) = watch::channel(0u64);
         Self {
             role: RwLock::new(Role::Primary),
             master: RwLock::new(None),
@@ -62,6 +66,7 @@ impl Replication {
             sender,
             barrier: RwLock::new(()),
             replica_count: AtomicU64::new(0),
+            gen_tx,
         }
     }
 
@@ -90,9 +95,30 @@ impl Replication {
         self.sender.subscribe()
     }
 
+    /// Current replica "generation"; bumped whenever the master target changes
+    /// (set_master / promote). A replica_client task is tied to the generation
+    /// in effect when it was spawned.
+    pub fn current_gen(&self) -> u64 {
+        *self.gen_tx.borrow()
+    }
+    fn gen_subscribe(&self) -> watch::Receiver<u64> {
+        self.gen_tx.subscribe()
+    }
+    fn bump_gen(&self) -> u64 {
+        let mut new = 0;
+        self.gen_tx.send_modify(|g| {
+            *g += 1;
+            new = *g;
+        });
+        new
+    }
+
     /// Feed a write command to all replicas. Cheap when there are no subscribers.
     /// Called from the synchronous command path.
     pub fn feed(&self, command: &[Bytes]) {
+        if *self.role.read() != Role::Primary {
+            return;
+        }
         let frame = encode_command(command);
         let _g = self.feed_lock.lock();
         let new_off =
@@ -102,14 +128,16 @@ impl Replication {
     }
 
     /// Become a replica of host:port. Sets role + master info; the actual
-    /// connection is driven by the replica client task.
-    pub fn set_master(&self, host: String, port: u16) {
+    /// connection is driven by the replica client task. Returns the new
+    /// generation so the caller can tie the spawned task to it.
+    pub fn set_master(&self, host: String, port: u16) -> u64 {
         *self.role.write() = Role::Replica;
         *self.master.write() = Some(MasterInfo {
             host,
             port,
             link_up: false,
         });
+        self.bump_gen()
     }
 
     pub fn set_link_up(&self, up: bool) {
@@ -119,10 +147,12 @@ impl Replication {
     }
 
     /// Promote to primary (`REPLICAOF NO ONE`). Fresh replid, keep offset.
+    /// Bumps the generation to cancel any running replica_client task.
     pub fn promote(&self) {
         *self.role.write() = Role::Primary;
         *self.master.write() = None;
         *self.replid.write() = gen_replid();
+        self.bump_gen();
     }
 }
 
@@ -272,8 +302,8 @@ async fn read_command<R: AsyncBufReadExt + Unpin>(
 }
 
 /// Run the replica side forever: (re)connect to `host:port`, full-sync, then
-/// apply the live stream. Stops if this node is no longer a replica of this
-/// exact master (promoted or re-pointed).
+/// apply the live stream. Stops when superseded by a newer REPLICAOF/promote
+/// (detected via the generation watch channel).
 #[allow(clippy::too_many_arguments)]
 pub async fn replica_client(
     repl: std::sync::Arc<Replication>,
@@ -281,17 +311,19 @@ pub async fn replica_client(
     port: u16,
     masterauth: String,
     listening_port: u16,
+    my_gen: u64,
     clear: impl Fn() + Send + Sync,
     load: impl Fn(&[u8]) + Send + Sync,
     apply: impl Fn(Vec<Bytes>) + Send + Sync,
 ) {
+    let mut gen_rx = repl.gen_subscribe();
     let mut backoff = Duration::from_millis(200);
     loop {
-        match repl.master() {
-            Some(m) if m.host == host && m.port == port => {}
-            _ => return, // no longer replicating from this master
+        // Stop if a newer REPLICAOF/promote superseded this task.
+        if repl.current_gen() != my_gen {
+            return;
         }
-        match connect_and_sync(
+        let sync = connect_and_sync(
             &repl,
             &host,
             port,
@@ -300,17 +332,19 @@ pub async fn replica_client(
             &clear,
             &load,
             &apply,
-        )
-        .await
-        {
-            Ok(()) => {
-                eprintln!("replication: stream closed by master {}:{}", host, port);
+        );
+        tokio::select! {
+            res = sync => {
+                match res {
+                    Ok(()) => eprintln!("replication stream closed by master {}:{}", host, port),
+                    Err(e) => eprintln!("replica sync failed ({}:{}): {}; retrying", host, port, e),
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "replication: sync failed ({}:{}): {}; retrying",
-                    host, port, e
-                );
+            _ = gen_rx.changed() => {
+                // Superseded mid-connection: drop the socket (the `sync` future is
+                // cancelled here) and exit so we never apply concurrently with the
+                // new task.
+                return;
             }
         }
         repl.set_link_up(false);
