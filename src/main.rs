@@ -1364,6 +1364,22 @@ async fn handle_connection(
 
         match parse_result {
             Ok(Ok(command)) => {
+                // PSYNC: this connection becomes a replication stream; hand it off.
+                if !command.is_empty()
+                    && command[0].len() == 5
+                    && command[0].eq_ignore_ascii_case(b"PSYNC")
+                {
+                    // Flush any pending buffered response first.
+                    let _ = writer.flush(&mut stream).await;
+                    if let Some(r) = REPLICATION.get()
+                        && let Err(e) = replication::serve_replica(r, &store, &mut stream).await
+                    {
+                        eprintln!("replica connection ended: {}", e);
+                    }
+                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                    return; // connection is consumed by replication
+                }
+
                 execute_command(&store, &command, &mut writer, &mut state, now);
                 batch_count += 1;
 

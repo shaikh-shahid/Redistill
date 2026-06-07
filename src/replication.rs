@@ -6,9 +6,12 @@
 //! a monotonic byte offset. Replicas receive a consistent snapshot followed by
 //! the live command stream and apply it through the normal command path.
 
+use crate::persistence::dump_store_to_bytes;
+use crate::store::ShardedStore;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +144,69 @@ pub fn encode_command(command: &[Bytes]) -> Bytes {
         buf.extend_from_slice(b"\r\n");
     }
     Bytes::from(buf)
+}
+
+/// Serve a replica over `stream` after it issued PSYNC. Runs until the replica
+/// disconnects or a write error occurs.
+pub async fn serve_replica<S>(
+    repl: &Replication,
+    store: &ShardedStore,
+    stream: &mut S,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // --- Consistency cut: exclusive barrier => quiescent store + single offset.
+    // All sync work; the guard is dropped at the end of this block, before any await.
+    let (snapshot, cut_offset, replid, mut rx) = {
+        let _ex = repl.barrier.write();
+        let rx = repl.subscribe(); // subscribe inside the exclusive section
+        let cut = repl.offset();
+        let snap = dump_store_to_bytes(store).map_err(std::io::Error::other)?;
+        (snap, cut, repl.replid(), rx)
+    };
+
+    // --- FULLRESYNC line.
+    let line = format!("+FULLRESYNC {} {}\r\n", replid, cut_offset);
+    stream.write_all(line.as_bytes()).await?;
+
+    // --- Length-prefixed snapshot payload: "$<len>\r\n<bytes>" (no trailing CRLF).
+    let hdr = format!("${}\r\n", snapshot.len());
+    stream.write_all(hdr.as_bytes()).await?;
+    stream.write_all(&snapshot).await?;
+    stream.flush().await?;
+
+    repl.incr_replicas();
+    let result = stream_loop(&mut rx, cut_offset, stream).await;
+    repl.decr_replicas();
+    result
+}
+
+async fn stream_loop<S>(
+    rx: &mut broadcast::Receiver<Frame>,
+    cut_offset: u64,
+    stream: &mut S,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    loop {
+        match rx.recv().await {
+            Ok((end_off, bytes)) => {
+                // Discard frames already captured in the snapshot.
+                if end_off <= cut_offset {
+                    continue;
+                }
+                stream.write_all(&bytes).await?;
+                stream.flush().await?;
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Replica too slow: drop it so it reconnects and full-resyncs.
+                return Err(std::io::Error::other("replica lagged off the backlog"));
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
