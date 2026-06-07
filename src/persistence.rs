@@ -222,7 +222,6 @@ fn read_snapshot<R: std::io::Read>(r: &mut R, store: &ShardedStore) -> Result<us
 
     let now = get_timestamp();
     let mut loaded: usize = 0;
-    let mut skipped_expired: usize = 0;
 
     for _ in 0..entry_count {
         let mut len_bytes = [0u8; 4];
@@ -235,30 +234,8 @@ fn read_snapshot<R: std::io::Read>(r: &mut R, store: &ShardedStore) -> Result<us
         r.read_exact(&mut entry_data)
             .map_err(|e| format!("Failed to read entry data: {}", e))?;
 
-        // apply_snapshot_entry returns Ok(()) for expired entries too; track separately.
-        // We re-check expiry here so we can count skipped entries for logging.
-        let expiry_check: Option<u64> = bincode::deserialize::<SnapshotEntry>(&entry_data)
-            .ok()
-            .and_then(|e| e.expiry)
-            .or_else(|| {
-                bincode::deserialize::<LegacySnapshotEntry>(&entry_data)
-                    .ok()
-                    .and_then(|e| e.expiry)
-            });
-
-        if let Some(exp) = expiry_check
-            && now >= exp
-        {
-            skipped_expired += 1;
-            continue;
-        }
-
         apply_snapshot_entry(store, &entry_data, now)?;
         loaded += 1;
-    }
-
-    if skipped_expired > 0 {
-        eprintln!("(skipped {} expired keys during load)", skipped_expired);
     }
 
     Ok(loaded)
