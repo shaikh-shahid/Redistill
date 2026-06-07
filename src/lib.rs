@@ -642,3 +642,219 @@ pub fn evict_if_needed(_store: &ShardedStore, _needed_size: usize) -> bool {
     // In tests with default config (max_memory = 0), always allow
     true
 }
+
+// ==================== In-Memory Snapshot (Replication) ====================
+
+/// In-memory snapshot serialization/deserialization for replication.
+///
+/// Produces and consumes the same RDST binary format as `persistence.rs` so
+/// that a snapshot can be shipped over a socket and loaded on a replica.
+pub mod persistence {
+    use super::{Bytes, EntryValue, ShardedStore};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU8, AtomicU32};
+    use std::sync::{Arc, RwLock};
+
+    use super::Entry;
+
+    const SNAPSHOT_MAGIC: &[u8; 4] = b"RDST";
+    const SNAPSHOT_VERSION: u8 = 1;
+
+    #[derive(Serialize, Deserialize)]
+    enum SnapshotValue {
+        String(Vec<u8>),
+        Hash(Vec<(Vec<u8>, Vec<u8>)>),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SnapshotEntry {
+        key: Vec<u8>,
+        value: SnapshotValue,
+        expiry: Option<u64>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacySnapshotEntry {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expiry: Option<u64>,
+    }
+
+    fn write_snapshot<W: std::io::Write>(w: &mut W, store: &ShardedStore) -> Result<usize, String> {
+        let now = super::get_timestamp();
+        let keys = store.keys(now);
+        let key_count = keys.len() as u64;
+
+        w.write_all(SNAPSHOT_MAGIC)
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+        w.write_all(&[SNAPSHOT_VERSION])
+            .map_err(|e| format!("Failed to write version: {}", e))?;
+        w.write_all(&now.to_le_bytes())
+            .map_err(|e| format!("Failed to write timestamp: {}", e))?;
+        w.write_all(&key_count.to_le_bytes())
+            .map_err(|e| format!("Failed to write entry count: {}", e))?;
+
+        let mut count: usize = 0;
+        for key in &keys {
+            let shard = &store.shards[store.hash(key)];
+            let Some(entry) = shard.get(key.as_ref()) else {
+                continue;
+            };
+
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
+                continue;
+            }
+
+            let snapshot_value = match &entry.value {
+                EntryValue::String(bytes) => SnapshotValue::String(bytes.to_vec()),
+                EntryValue::Hash(hash_map) => {
+                    let map_guard = hash_map.read().unwrap();
+                    let mut fields = Vec::with_capacity(map_guard.len());
+                    for (k, v) in map_guard.iter() {
+                        fields.push((k.to_vec(), v.to_vec()));
+                    }
+                    SnapshotValue::Hash(fields)
+                }
+            };
+
+            let snapshot_entry = SnapshotEntry {
+                key: key.to_vec(),
+                value: snapshot_value,
+                expiry: entry.expiry,
+            };
+
+            let encoded = bincode::serialize(&snapshot_entry)
+                .map_err(|e| format!("Failed to serialize entry: {}", e))?;
+
+            w.write_all(&(encoded.len() as u32).to_le_bytes())
+                .map_err(|e| format!("Failed to write entry length: {}", e))?;
+            w.write_all(&encoded)
+                .map_err(|e| format!("Failed to write entry data: {}", e))?;
+
+            count += 1;
+        }
+
+        w.flush().map_err(|e| format!("Failed to flush: {}", e))?;
+        Ok(count)
+    }
+
+    fn read_snapshot<R: std::io::Read>(r: &mut R, store: &ShardedStore) -> Result<usize, String> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)
+            .map_err(|e| format!("Failed to read magic: {}", e))?;
+        if &magic != SNAPSHOT_MAGIC {
+            return Err("Invalid snapshot (bad magic)".to_string());
+        }
+
+        let mut version = [0u8; 1];
+        r.read_exact(&mut version)
+            .map_err(|e| format!("Failed to read version: {}", e))?;
+        if version[0] != SNAPSHOT_VERSION {
+            return Err(format!("Unsupported snapshot version: {}", version[0]));
+        }
+
+        let mut timestamp_bytes = [0u8; 8];
+        r.read_exact(&mut timestamp_bytes)
+            .map_err(|e| format!("Failed to read timestamp: {}", e))?;
+        let _snapshot_time = u64::from_le_bytes(timestamp_bytes);
+
+        let mut count_bytes = [0u8; 8];
+        r.read_exact(&mut count_bytes)
+            .map_err(|e| format!("Failed to read entry count: {}", e))?;
+        let entry_count = u64::from_le_bytes(count_bytes);
+
+        let now = super::get_timestamp();
+        let mut loaded: usize = 0;
+        let mut skipped_expired: usize = 0;
+
+        for _ in 0..entry_count {
+            let mut len_bytes = [0u8; 4];
+            if r.read_exact(&mut len_bytes).is_err() {
+                break;
+            }
+            let entry_len = u32::from_le_bytes(len_bytes) as usize;
+
+            let mut entry_data = vec![0u8; entry_len];
+            r.read_exact(&mut entry_data)
+                .map_err(|e| format!("Failed to read entry data: {}", e))?;
+
+            let (key, entry_value, expiry) =
+                match bincode::deserialize::<SnapshotEntry>(&entry_data) {
+                    Ok(se) => {
+                        let expiry = se.expiry;
+                        let value = match se.value {
+                            SnapshotValue::String(bytes) => EntryValue::String(Bytes::from(bytes)),
+                            SnapshotValue::Hash(fields) => {
+                                let mut map = HashMap::new();
+                                for (field, val) in fields {
+                                    map.insert(Bytes::from(field), Bytes::from(val));
+                                }
+                                EntryValue::Hash(Arc::new(RwLock::new(map)))
+                            }
+                        };
+                        (Bytes::from(se.key), value, expiry)
+                    }
+                    Err(_) => {
+                        let le: LegacySnapshotEntry = bincode::deserialize(&entry_data)
+                            .map_err(|e| format!("Failed to deserialize entry: {}", e))?;
+                        (
+                            Bytes::from(le.key),
+                            EntryValue::String(Bytes::from(le.value)),
+                            le.expiry,
+                        )
+                    }
+                };
+
+            if let Some(exp) = expiry
+                && now >= exp
+            {
+                skipped_expired += 1;
+                continue;
+            }
+
+            let ttl = expiry.and_then(|exp| if exp > now { Some(exp - now) } else { None });
+
+            let shard_idx = store.hash(&key);
+            let shard = &store.shards[shard_idx];
+            shard.insert(
+                key,
+                Entry {
+                    value: entry_value,
+                    expiry: ttl.map(|t| now + t),
+                    last_accessed: AtomicU32::new(0),
+                    queue_type: AtomicU8::new(0),
+                    access_count: AtomicU8::new(0),
+                },
+            );
+
+            loaded += 1;
+        }
+
+        if skipped_expired > 0 {
+            eprintln!("(skipped {} expired keys during load)", skipped_expired);
+        }
+
+        Ok(loaded)
+    }
+
+    /// Serialize the entire store to a `Vec<u8>` using the RDST snapshot format.
+    ///
+    /// The returned bytes can be shipped over a socket and loaded on a replica
+    /// with [`load_store_from_bytes`].
+    pub fn dump_store_to_bytes(store: &ShardedStore) -> Result<Vec<u8>, String> {
+        let mut buf = std::io::Cursor::new(Vec::with_capacity(64 * 1024));
+        let _count = write_snapshot(&mut buf, store)?;
+        Ok(buf.into_inner())
+    }
+
+    /// Populate `store` from a byte slice produced by [`dump_store_to_bytes`].
+    ///
+    /// Returns the number of non-expired entries loaded.
+    pub fn load_store_from_bytes(store: &ShardedStore, data: &[u8]) -> Result<usize, String> {
+        let mut cur = std::io::Cursor::new(data);
+        read_snapshot(&mut cur, store)
+    }
+}
