@@ -16,6 +16,7 @@ mod aof;
 mod config;
 mod persistence;
 mod protocol;
+mod replication;
 mod server;
 mod store;
 
