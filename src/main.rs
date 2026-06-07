@@ -190,6 +190,17 @@ fn execute_command(
         return;
     }
 
+    // REPLCONF <option> <value> ...  -> +OK   (replication handshake)
+    if cmd.len() == 8 && cmd.eq_ignore_ascii_case(b"REPLCONF") {
+        if command.len() >= 3 && command[1].eq_ignore_ascii_case(b"listening-port") {
+            if let Ok(s) = std::str::from_utf8(&command[2]) {
+                state.replconf_port = s.parse().ok();
+            }
+        }
+        writer.write_simple_string(b"OK");
+        return;
+    }
+
     match cmd.len() {
         3 => {
             if eq_ignore_case_3(cmd, b"set") {
@@ -1509,6 +1520,8 @@ async fn main() {
                 let mut scratch = RespWriter::new();
                 let mut replay_state = ConnectionState {
                     authenticated: true,
+                    from_master: true,
+                    replconf_port: None,
                 };
                 let replay_now = get_timestamp();
                 loop {
