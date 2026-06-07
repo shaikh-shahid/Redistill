@@ -96,8 +96,19 @@ fn on_write(command: &[Bytes]) {
 /// Commands that mutate state (must match the set of handlers that call `on_write`).
 fn is_write_command(cmd: &[u8]) -> bool {
     const WRITES: &[&[u8]] = &[
-        b"set", b"del", b"incr", b"incrby", b"decr", b"decrby", b"mset", b"hset", b"hdel",
-        b"expire", b"persist",
+        b"set",
+        b"del",
+        b"incr",
+        b"incrby",
+        b"decr",
+        b"decrby",
+        b"mset",
+        b"hset",
+        b"hdel",
+        b"expire",
+        b"persist",
+        b"flushdb",
+        b"flushall",
     ];
     WRITES.iter().any(|w| cmd.eq_ignore_ascii_case(w))
 }
@@ -543,6 +554,7 @@ fn execute_command(
                         }
                         // CAS failed - another thread modified MEMORY_USED, retry with new value
                     }
+                    on_write(command);
                     writer.write_simple_string(b"OK");
                     return;
                 }
@@ -627,6 +639,7 @@ fn execute_command(
                         }
                         // CAS failed - another thread modified MEMORY_USED, retry with new value
                     }
+                    on_write(command);
                     writer.write_simple_string(b"OK");
                     return;
                 }
