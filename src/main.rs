@@ -56,6 +56,19 @@ static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
 // `OnceCell::get()` returning None — no allocation, no lock.
 static AOF: once_cell::sync::OnceCell<Arc<aof::Aof>> = once_cell::sync::OnceCell::new();
 
+// Global replication handle. Set unconditionally at startup so the hot path
+// in execute_command always sees a valid pointer after initialization.
+static REPLICATION: once_cell::sync::OnceCell<Arc<replication::Replication>> =
+    once_cell::sync::OnceCell::new();
+
+#[inline(always)]
+#[allow(dead_code)]
+fn repl() -> &'static Arc<replication::Replication> {
+    REPLICATION
+        .get()
+        .expect("REPLICATION initialized at startup")
+}
+
 /// Append a write command to the AOF if enabled. Designed to be inlined into
 /// the dispatch in `execute_command`.
 #[inline]
@@ -67,6 +80,16 @@ fn aof_log(command: &[Bytes]) {
         // cache is better than a dead one. Surface loudly; future work: track
         // a counter and expose via INFO.
         eprintln!("AOF append failed: {}", e);
+    }
+}
+
+/// Called after every successful write command: append to AOF (if enabled)
+/// and feed the replication stream (if any replicas).
+#[inline(always)]
+fn on_write(command: &[Bytes]) {
+    aof_log(command);
+    if let Some(r) = REPLICATION.get() {
+        r.feed(command);
     }
 }
 
@@ -151,6 +174,11 @@ fn execute_command(
         return;
     }
 
+    // Hold the replication barrier shared for the whole command so a full-sync
+    // cut (which takes it exclusively) sees a quiescent store. Cheap, concurrent
+    // read-lock; only contended briefly during a replica's initial sync.
+    let _repl_guard = REPLICATION.get().map(|r| r.barrier.read());
+
     let cmd = &command[0];
 
     // AUTH and PING don't require authentication
@@ -166,7 +194,7 @@ fn execute_command(
         3 => {
             if eq_ignore_case_3(cmd, b"set") {
                 handle_set(store, command, writer, now);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_3(cmd, b"ttl") {
@@ -190,7 +218,7 @@ fn execute_command(
                     writer.write_integer(count);
                     // Only log on deletes that passed arg validation; an empty
                     // DEL is a no-op we don't need to replay.
-                    aof_log(command);
+                    on_write(command);
                 } else {
                     writer.write_error(b"wrong number of arguments");
                 }
@@ -223,12 +251,12 @@ fn execute_command(
             }
             if eq_ignore_case_3(&cmd[..3], b"inc") && (cmd[3] | 0x20) == b'r' {
                 handle_incr(store, command, writer, now, 1);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"dec") && (cmd[3] | 0x20) == b'r' {
                 handle_incr(store, command, writer, now, -1);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"ptt") && (cmd[3] | 0x20) == b'l' {
@@ -241,7 +269,7 @@ fn execute_command(
             }
             if eq_ignore_case_3(&cmd[..3], b"mse") && (cmd[3] | 0x20) == b't' {
                 handle_mset(store, command, writer, now);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h' {
@@ -260,7 +288,7 @@ fn execute_command(
                 }
                 if &lower == b"hset" {
                     handle_hset(store, command, writer, now);
-                    aof_log(command);
+                    on_write(command);
                     return;
                 }
                 if &lower == b"hget" {
@@ -269,7 +297,7 @@ fn execute_command(
                 }
                 if &lower == b"hdel" {
                     handle_hdel(store, command, writer, now);
-                    aof_log(command);
+                    on_write(command);
                     return;
                 }
                 if &lower == b"type" {
@@ -331,17 +359,17 @@ fn execute_command(
             }
             if eq_ignore_case_6(cmd, b"incrby") {
                 handle_incrby(store, command, writer, now);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_6(cmd, b"decrby") {
                 handle_decrby(store, command, writer, now);
-                aof_log(command);
+                on_write(command);
                 return;
             }
             if eq_ignore_case_6(cmd, b"expire") {
                 handle_expire(store, command, writer, now);
-                aof_log(command);
+                on_write(command);
                 return;
             }
         }
@@ -415,7 +443,7 @@ fn execute_command(
                 }
                 if &lower == b"persist" {
                     handle_persist(store, command, writer, now);
-                    aof_log(command);
+                    on_write(command);
                     return;
                 }
                 if &lower == b"hgetall" {
@@ -1363,6 +1391,12 @@ async fn main() {
 
     // Initialize store
     let store = ShardedStore::new(config.server.num_shards);
+
+    // Initialize replication state. Must happen before AOF replay because
+    // replay calls execute_command which takes the barrier read-guard.
+    let _ = REPLICATION.set(Arc::new(replication::Replication::new(
+        config.replication.repl_backlog_size,
+    )));
 
     // Force START_TIME initialization
     let _ = *START_TIME;
