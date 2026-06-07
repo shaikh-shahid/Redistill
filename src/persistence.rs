@@ -368,3 +368,51 @@ pub async fn snapshot_task(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ShardedStore;
+    use bytes::Bytes;
+
+    #[test]
+    fn dump_and_load_roundtrip_strings_and_hashes() {
+        let now = crate::store::get_timestamp();
+        let src = ShardedStore::new(16);
+
+        // 2 strings (one with TTL) + 1 hash field
+        src.set(
+            Bytes::from_static(b"k1"),
+            Bytes::from_static(b"v1"),
+            None,
+            now,
+        );
+        src.set(
+            Bytes::from_static(b"k2"),
+            Bytes::from_static(b"v2"),
+            Some(now + 100_000), // TTL well in the future (ms)
+            now,
+        );
+        src.hset(
+            Bytes::from_static(b"h1"),
+            &[(Bytes::from_static(b"f1"), Bytes::from_static(b"hv1"))],
+            now,
+        )
+        .unwrap();
+
+        let bytes = dump_store_to_bytes(&src).expect("dump");
+
+        let dst = ShardedStore::new(16);
+        let count = load_store_from_bytes(&dst, &bytes).expect("load");
+
+        assert_eq!(count, 3);
+
+        let now2 = crate::store::get_timestamp();
+        assert_eq!(dst.get(b"k1", now2), Some(Bytes::from_static(b"v1")));
+        assert_eq!(dst.get(b"k2", now2), Some(Bytes::from_static(b"v2")));
+        assert_eq!(
+            dst.hget(b"h1", b"f1", now2).unwrap(),
+            Some(Bytes::from_static(b"hv1"))
+        );
+    }
+}
