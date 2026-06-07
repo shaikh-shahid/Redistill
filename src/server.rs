@@ -179,8 +179,6 @@ pub async fn start_health_check_server(
 pub struct ConnectionState {
     pub authenticated: bool,
     /// True only for the internal replica-apply path; bypasses the read-only gate.
-    // Used in Task 7 (read-only gate); forward-declared here.
-    #[allow(dead_code)]
     pub from_master: bool,
     /// Replica's advertised listening port (from REPLCONF listening-port).
     pub replconf_port: Option<u16>,

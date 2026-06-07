@@ -36,7 +36,8 @@ use tokio_rustls::TlsAcceptor;
 // Re-export from modules for internal use
 use config::{CONFIG, EvictionPolicy, format_bytes};
 use persistence::{
-    LAST_SAVE_TIME, SAVE_IN_PROGRESS, load_snapshot, save_snapshot_sync, snapshot_task,
+    LAST_SAVE_TIME, SAVE_IN_PROGRESS, load_snapshot, load_store_from_bytes, save_snapshot_sync,
+    snapshot_task,
 };
 use protocol::{RespParser, RespWriter, eq_ignore_case_3, eq_ignore_case_6, parse_i64, parse_u64};
 use server::{
@@ -62,7 +63,6 @@ static REPLICATION: once_cell::sync::OnceCell<Arc<replication::Replication>> =
     once_cell::sync::OnceCell::new();
 
 #[inline(always)]
-#[allow(dead_code)]
 fn repl() -> &'static Arc<replication::Replication> {
     REPLICATION
         .get()
@@ -91,6 +91,50 @@ fn on_write(command: &[Bytes]) {
     if let Some(r) = REPLICATION.get() {
         r.feed(command);
     }
+}
+
+/// Commands that mutate state (must match the set of handlers that call `on_write`).
+fn is_write_command(cmd: &[u8]) -> bool {
+    const WRITES: &[&[u8]] = &[
+        b"set", b"del", b"incr", b"incrby", b"decr", b"decrby", b"mset", b"hset", b"hdel",
+        b"expire", b"persist",
+    ];
+    WRITES.iter().any(|w| cmd.eq_ignore_ascii_case(w))
+}
+
+fn spawn_replica_task(store: ShardedStore, host: String, port: u16) {
+    let r = repl().clone();
+    let masterauth = CONFIG.replication.masterauth.clone();
+    let listening_port = CONFIG.server.port;
+    let clear_store = store.clone();
+    let load_store = store.clone();
+    let apply_store = store.clone();
+
+    tokio::spawn(async move {
+        replication::replica_client(
+            r,
+            host,
+            port,
+            masterauth,
+            listening_port,
+            move || clear_store.clear(),
+            move |bytes: &[u8]| {
+                if let Err(e) = load_store_from_bytes(&load_store, bytes) {
+                    eprintln!("failed to load replica snapshot: {}", e);
+                }
+            },
+            move |cmd: Vec<Bytes>| {
+                let mut scratch = ConnectionState::new();
+                scratch.authenticated = true;
+                scratch.from_master = true;
+                let mut w = RespWriter::new();
+                let now = get_timestamp();
+                execute_command(&apply_store, &cmd, &mut w, &mut scratch, now);
+                w.clear(); // discard reply; replica applies silently
+            },
+        )
+        .await;
+    });
 }
 
 // Thread-local command counter for batching updates
@@ -187,6 +231,59 @@ fn execute_command(
 
     if requires_auth && !state.authenticated {
         writer.write_error(b"NOAUTH Authentication required");
+        return;
+    }
+
+    // Reject client writes on a read-only replica. The internal apply path sets
+    // `from_master = true` and bypasses this.
+    if !state.from_master
+        && CONFIG.replication.replica_read_only
+        && REPLICATION.get().map(|r| r.role()) == Some(replication::Role::Replica)
+        && is_write_command(cmd)
+    {
+        writer.write_error_raw(b"READONLY You can't write against a read only replica.");
+        return;
+    }
+
+    // REPLICAOF / SLAVEOF
+    if (cmd.len() == 9 && cmd.eq_ignore_ascii_case(b"REPLICAOF"))
+        || (cmd.len() == 7 && cmd.eq_ignore_ascii_case(b"SLAVEOF"))
+    {
+        if command.len() != 3 {
+            writer.write_error(b"wrong number of arguments for 'replicaof'");
+            return;
+        }
+        if command[1].eq_ignore_ascii_case(b"NO") && command[2].eq_ignore_ascii_case(b"ONE") {
+            repl().promote();
+            writer.write_simple_string(b"OK");
+            return;
+        }
+        let host = match std::str::from_utf8(&command[1]) {
+            Ok(h) => h.to_string(),
+            Err(_) => {
+                writer.write_error(b"invalid host");
+                return;
+            }
+        };
+        let port: u16 = match std::str::from_utf8(&command[2])
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            Some(p) => p,
+            None => {
+                writer.write_error(b"invalid port");
+                return;
+            }
+        };
+        if (host == "127.0.0.1" || host == "localhost" || host == CONFIG.server.bind)
+            && port == CONFIG.server.port
+        {
+            writer.write_error(b"REPLICAOF would create a replication cycle to self");
+            return;
+        }
+        repl().set_master(host.clone(), port);
+        spawn_replica_task(store.clone(), host, port);
+        writer.write_simple_string(b"OK");
         return;
     }
 
@@ -1425,6 +1522,25 @@ async fn main() {
     let _ = REPLICATION.set(Arc::new(replication::Replication::new(
         config.replication.repl_backlog_size,
     )));
+
+    // Start replicating from a master if configured.
+    if !CONFIG.replication.replicaof.is_empty() {
+        match CONFIG.replication.replicaof.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => {
+                    let host = h.to_string();
+                    repl().set_master(host.clone(), port);
+                    spawn_replica_task(store.clone(), host, port);
+                    println!("replicating from {}:{}", h, port);
+                }
+                Err(_) => eprintln!("invalid replicaof port: {}", p),
+            },
+            None => eprintln!(
+                "invalid replicaof (expected host:port): {}",
+                CONFIG.replication.replicaof
+            ),
+        }
+    }
 
     // Force START_TIME initialization
     let _ = *START_TIME;

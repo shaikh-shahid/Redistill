@@ -11,7 +11,9 @@ use crate::store::ShardedStore;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +207,175 @@ where
                 return Err(std::io::Error::other("replica lagged off the backlog"));
             }
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+/// Read one CRLF-terminated line, returned without the trailing CRLF.
+async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let n = r.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Err(std::io::Error::other("eof during line read"));
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(buf)
+}
+
+/// Read a `$<len>\r\n` bulk-length header and return len.
+async fn read_bulk_len<R: AsyncBufReadExt + Unpin>(r: &mut R) -> std::io::Result<usize> {
+    let line = read_line(r).await?;
+    if line.first() != Some(&b'$') {
+        return Err(std::io::Error::other("expected $ bulk length"));
+    }
+    std::str::from_utf8(&line[1..])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| std::io::Error::other("bad bulk length"))
+}
+
+/// Read one RESP array command (`*N` + N bulk strings each with trailing CRLF).
+/// Returns Ok(None) on a clean EOF before any bytes.
+async fn read_command<R: AsyncBufReadExt + Unpin>(
+    r: &mut R,
+) -> std::io::Result<Option<Vec<Bytes>>> {
+    let mut header = Vec::new();
+    let n = r.read_until(b'\n', &mut header).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if header.first() != Some(&b'*') {
+        return Err(std::io::Error::other("expected * array header"));
+    }
+    while header.last() == Some(&b'\n') || header.last() == Some(&b'\r') {
+        header.pop();
+    }
+    let count: usize = std::str::from_utf8(&header[1..])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| std::io::Error::other("bad array len"))?;
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_bulk_len(r).await?;
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf).await?;
+        let mut crlf = [0u8; 2];
+        r.read_exact(&mut crlf).await?; // consume trailing CRLF
+        parts.push(Bytes::from(buf));
+    }
+    Ok(Some(parts))
+}
+
+/// Run the replica side forever: (re)connect to `host:port`, full-sync, then
+/// apply the live stream. Stops if this node is no longer a replica of this
+/// exact master (promoted or re-pointed).
+#[allow(clippy::too_many_arguments)]
+pub async fn replica_client(
+    repl: std::sync::Arc<Replication>,
+    host: String,
+    port: u16,
+    masterauth: String,
+    listening_port: u16,
+    clear: impl Fn() + Send + Sync,
+    load: impl Fn(&[u8]) + Send + Sync,
+    apply: impl Fn(Vec<Bytes>) + Send + Sync,
+) {
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match repl.master() {
+            Some(m) if m.host == host && m.port == port => {}
+            _ => return, // no longer replicating from this master
+        }
+        match connect_and_sync(
+            &repl,
+            &host,
+            port,
+            &masterauth,
+            listening_port,
+            &clear,
+            &load,
+            &apply,
+        )
+        .await
+        {
+            Ok(()) => {
+                eprintln!("replication: stream closed by master {}:{}", host, port);
+            }
+            Err(e) => {
+                eprintln!(
+                    "replication: sync failed ({}:{}): {}; retrying",
+                    host, port, e
+                );
+            }
+        }
+        repl.set_link_up(false);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_sync(
+    repl: &Replication,
+    host: &str,
+    port: u16,
+    masterauth: &str,
+    listening_port: u16,
+    clear: &(impl Fn() + Send + Sync),
+    load: &(impl Fn(&[u8]) + Send + Sync),
+    apply: &(impl Fn(Vec<Bytes>) + Send + Sync),
+) -> std::io::Result<()> {
+    let stream = TcpStream::connect((host, port)).await?;
+    let (rd, mut wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
+
+    // Handshake.
+    wr.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    read_line(&mut reader).await?; // +PONG
+
+    if !masterauth.is_empty() {
+        let auth = encode_command(&[
+            Bytes::from_static(b"AUTH"),
+            Bytes::from(masterauth.as_bytes().to_vec()),
+        ]);
+        wr.write_all(&auth).await?;
+        read_line(&mut reader).await?; // +OK
+    }
+
+    let lport = encode_command(&[
+        Bytes::from_static(b"REPLCONF"),
+        Bytes::from_static(b"listening-port"),
+        Bytes::from(listening_port.to_string().into_bytes()),
+    ]);
+    wr.write_all(&lport).await?;
+    read_line(&mut reader).await?; // +OK
+
+    wr.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .await?;
+    let _fullresync = read_line(&mut reader).await?; // +FULLRESYNC <replid> <offset>
+
+    // Snapshot: $<len>\r\n<bytes>  (no trailing CRLF).
+    let len = read_bulk_len(&mut reader).await?;
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    clear();
+    load(&buf);
+    repl.set_link_up(true);
+    eprintln!(
+        "replication: full sync complete from {}:{} ({} bytes)",
+        host, port, len
+    );
+
+    // Live stream.
+    loop {
+        match read_command(&mut reader).await? {
+            Some(cmd) => apply(cmd),
+            None => return Ok(()),
         }
     }
 }
