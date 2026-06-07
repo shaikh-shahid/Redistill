@@ -1154,7 +1154,7 @@ fn handle_info(store: &ShardedStore, writer: &mut RespWriter) {
     let eviction_policy: EvictionPolicy = CONFIG.memory.eviction_policy.parse().unwrap_or_default();
     let rejected_connections = REJECTED_CONNECTIONS.load(Ordering::Relaxed);
 
-    let info = format!(
+    let mut info = format!(
         "# Server\r\n\
         redis_version:7.0.0\r\n\
         redis_mode:standalone\r\n\
@@ -1199,6 +1199,48 @@ fn handle_info(store: &ShardedStore, writer: &mut RespWriter) {
         rejected_connections,
         db_size
     );
+
+    // Replication section.
+    let r = repl();
+    match r.role() {
+        replication::Role::Primary => {
+            info.push_str(&format!(
+                "\r\n# Replication\r\n\
+                role:master\r\n\
+                connected_slaves:{}\r\n\
+                master_replid:{}\r\n\
+                master_repl_offset:{}\r\n",
+                r.replica_count(),
+                r.replid(),
+                r.offset()
+            ));
+        }
+        replication::Role::Replica => {
+            let (host, port, link_up) = r
+                .master()
+                .map(|m| (m.host, m.port, m.link_up))
+                .unwrap_or_default();
+            info.push_str(&format!(
+                "\r\n# Replication\r\n\
+                role:slave\r\n\
+                master_host:{}\r\n\
+                master_port:{}\r\n\
+                master_link_status:{}\r\n\
+                slave_read_only:{}\r\n\
+                master_repl_offset:{}\r\n",
+                host,
+                port,
+                if link_up { "up" } else { "down" },
+                if CONFIG.replication.replica_read_only {
+                    1
+                } else {
+                    0
+                },
+                r.offset()
+            ));
+        }
+    }
+
     writer.write_bulk_string(info.as_bytes());
 }
 
