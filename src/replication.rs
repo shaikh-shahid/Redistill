@@ -257,6 +257,20 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R) -> std::io::Result<Vec
     Ok(buf)
 }
 
+/// Read one handshake reply line, returning an error if the master replied with
+/// a RESP error (`-...`, e.g. `-NOAUTH ...`). `ctx` names the step for logging.
+async fn read_reply<R: AsyncBufReadExt + Unpin>(r: &mut R, ctx: &str) -> std::io::Result<Vec<u8>> {
+    let line = read_line(r).await?;
+    if line.first() == Some(&b'-') {
+        return Err(std::io::Error::other(format!(
+            "master rejected {}: {}",
+            ctx,
+            String::from_utf8_lossy(&line[1..])
+        )));
+    }
+    Ok(line)
+}
+
 /// Read a `$<len>\r\n` bulk-length header and return len.
 async fn read_bulk_len<R: AsyncBufReadExt + Unpin>(r: &mut R) -> std::io::Result<usize> {
     let line = read_line(r).await?;
@@ -368,9 +382,11 @@ async fn connect_and_sync(
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
-    // Handshake.
+    // Handshake. Each step validates the master's reply so a misconfiguration
+    // (e.g. wrong/missing masterauth → NOAUTH) surfaces a clear error and is
+    // retried, instead of silently proceeding into a broken sync.
     wr.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
-    read_line(&mut reader).await?; // +PONG
+    read_reply(&mut reader, "PING").await?; // +PONG
 
     if !masterauth.is_empty() {
         let auth = encode_command(&[
@@ -378,7 +394,7 @@ async fn connect_and_sync(
             Bytes::from(masterauth.as_bytes().to_vec()),
         ]);
         wr.write_all(&auth).await?;
-        read_line(&mut reader).await?; // +OK
+        read_reply(&mut reader, "AUTH").await?; // +OK
     }
 
     let lport = encode_command(&[
@@ -387,11 +403,17 @@ async fn connect_and_sync(
         Bytes::from(listening_port.to_string().into_bytes()),
     ]);
     wr.write_all(&lport).await?;
-    read_line(&mut reader).await?; // +OK
+    read_reply(&mut reader, "REPLCONF").await?; // +OK
 
     wr.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
         .await?;
-    let _fullresync = read_line(&mut reader).await?; // +FULLRESYNC <replid> <offset>
+    let fullresync = read_reply(&mut reader, "PSYNC").await?; // +FULLRESYNC <replid> <offset>
+    if !fullresync.starts_with(b"+FULLRESYNC") {
+        return Err(std::io::Error::other(format!(
+            "unexpected PSYNC reply: {}",
+            String::from_utf8_lossy(&fullresync)
+        )));
+    }
 
     // Snapshot: $<len>\r\n<bytes>  (no trailing CRLF).
     let len = read_bulk_len(&mut reader).await?;

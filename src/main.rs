@@ -1522,6 +1522,15 @@ async fn handle_connection(
                     && command[0].len() == 5
                     && command[0].eq_ignore_ascii_case(b"PSYNC")
                 {
+                    // Replication is privileged. PSYNC is handled here, before
+                    // execute_command, so it must enforce the same auth gate —
+                    // otherwise an unauthenticated client could PSYNC and pull a
+                    // full snapshot of the dataset, bypassing `requirepass`.
+                    if !state.authenticated {
+                        writer.write_error(b"NOAUTH Authentication required");
+                        let _ = writer.flush(&mut stream).await;
+                        continue; // let the client AUTH and retry; don't serve
+                    }
                     // Flush any pending buffered response first.
                     let _ = writer.flush(&mut stream).await;
                     if let Some(r) = REPLICATION.get()
