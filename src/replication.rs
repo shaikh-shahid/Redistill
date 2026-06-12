@@ -10,16 +10,26 @@ use crate::persistence::dump_store_to_bytes;
 use crate::store::ShardedStore;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Role {
-    Primary,
-    Replica,
+    Primary = 0,
+    Replica = 1,
+}
+
+impl Role {
+    fn from_u8(v: u8) -> Role {
+        match v {
+            0 => Role::Primary,
+            _ => Role::Replica,
+        }
+    }
 }
 
 /// State describing the primary this node replicates from (replica role only).
@@ -35,7 +45,9 @@ pub struct MasterInfo {
 pub type Frame = (u64, Bytes);
 
 pub struct Replication {
-    role: RwLock<Role>,
+    /// Current role as a `Role` discriminant. Atomic so the hot path
+    /// (feed / read-only gate / eviction gate) reads it without a lock.
+    role: AtomicU8,
     master: RwLock<Option<MasterInfo>>,
     replid: RwLock<String>,
     offset: AtomicU64,
@@ -58,7 +70,7 @@ impl Replication {
         let (sender, _rx) = broadcast::channel(backlog.max(16));
         let (gen_tx, _gen_rx) = watch::channel(0u64);
         Self {
-            role: RwLock::new(Role::Primary),
+            role: AtomicU8::new(Role::Primary as u8),
             master: RwLock::new(None),
             replid: RwLock::new(gen_replid()),
             offset: AtomicU64::new(0),
@@ -71,10 +83,18 @@ impl Replication {
     }
 
     pub fn role(&self) -> Role {
-        *self.role.read()
+        Role::from_u8(self.role.load(Ordering::Relaxed))
     }
     pub fn offset(&self) -> u64 {
         self.offset.load(Ordering::Relaxed)
+    }
+    /// Set the absolute replication offset (replica side: from FULLRESYNC).
+    pub fn set_offset(&self, v: u64) {
+        self.offset.store(v, Ordering::Relaxed);
+    }
+    /// Advance the replication offset (replica side: per applied frame).
+    pub fn add_offset(&self, n: u64) {
+        self.offset.fetch_add(n, Ordering::Relaxed);
     }
     pub fn replid(&self) -> String {
         self.replid.read().clone()
@@ -116,7 +136,7 @@ impl Replication {
     /// Feed a write command to all replicas. Cheap when there are no subscribers.
     /// Called from the synchronous command path.
     pub fn feed(&self, command: &[Bytes]) {
-        if *self.role.read() != Role::Primary {
+        if self.role() != Role::Primary {
             return;
         }
         let frame = encode_command(command);
@@ -131,7 +151,7 @@ impl Replication {
     /// connection is driven by the replica client task. Returns the new
     /// generation so the caller can tie the spawned task to it.
     pub fn set_master(&self, host: String, port: u16) -> u64 {
-        *self.role.write() = Role::Replica;
+        self.role.store(Role::Replica as u8, Ordering::Relaxed);
         *self.master.write() = Some(MasterInfo {
             host,
             port,
@@ -149,7 +169,7 @@ impl Replication {
     /// Promote to primary (`REPLICAOF NO ONE`). Fresh replid, keep offset.
     /// Bumps the generation to cancel any running replica_client task.
     pub fn promote(&self) {
-        *self.role.write() = Role::Primary;
+        self.role.store(Role::Primary as u8, Ordering::Relaxed);
         *self.master.write() = None;
         *self.replid.write() = gen_replid();
         self.bump_gen();
@@ -184,6 +204,7 @@ pub async fn serve_replica<S>(
     repl: &Replication,
     store: &ShardedStore,
     stream: &mut S,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -209,7 +230,7 @@ where
     stream.flush().await?;
 
     repl.incr_replicas();
-    let result = stream_loop(&mut rx, cut_offset, stream).await;
+    let result = stream_loop(&mut rx, cut_offset, stream, shutdown_rx).await;
     repl.decr_replicas();
     result
 }
@@ -218,12 +239,20 @@ async fn stream_loop<S>(
     rx: &mut broadcast::Receiver<Frame>,
     cut_offset: u64,
     stream: &mut S,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     loop {
-        match rx.recv().await {
+        let recv = tokio::select! {
+            biased;
+            // On shutdown, close the stream promptly so the replica sees EOF and
+            // fails over / reconnects, instead of waiting out the drain window.
+            _ = shutdown_rx.changed() => return Ok(()),
+            r = rx.recv() => r,
+        };
+        match recv {
             Ok((end_off, bytes)) => {
                 // Discard frames already captured in the snapshot.
                 if end_off <= cut_offset {
@@ -414,6 +443,15 @@ async fn connect_and_sync(
             String::from_utf8_lossy(&fullresync)
         )));
     }
+    // +FULLRESYNC <replid> <offset> — adopt the master's offset so the replica's
+    // INFO master_repl_offset reflects the stream position it starts from.
+    if let Some(off) = std::str::from_utf8(&fullresync)
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(2))
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        repl.set_offset(off);
+    }
 
     // Snapshot: $<len>\r\n<bytes>  (no trailing CRLF).
     let len = read_bulk_len(&mut reader).await?;
@@ -430,7 +468,11 @@ async fn connect_and_sync(
     // Live stream.
     loop {
         match read_command(&mut reader).await? {
-            Some(cmd) => apply(cmd),
+            Some(cmd) => {
+                let n = encode_command(&cmd).len() as u64;
+                apply(cmd);
+                repl.add_offset(n);
+            }
             None => return Ok(()),
         }
     }

@@ -199,7 +199,22 @@ async fn expiration_task(store: ShardedStore, mut shutdown_rx: watch::Receiver<b
         tokio::select! {
             biased;
             _ = shutdown_rx.changed() => break,
-            _ = interval.tick() => { expire_random_keys(&store, 20); }
+            _ = interval.tick() => {
+                // Only the primary actively expires keys and propagates the
+                // deletions. A replica waits for the master's DELs so the two
+                // never diverge (no independent expiry on a replica).
+                if REPLICATION.get().map(|r| r.role()) != Some(replication::Role::Primary) {
+                    continue;
+                }
+                // No barrier here (unlike client writes): an expiry DEL is
+                // idempotent, so it is correct whether it lands in the snapshot,
+                // the live stream, or both. Taking the barrier here would also
+                // contend with a full-sync cut's exclusive guard.
+                let expired = expire_random_keys(&store, 20);
+                for key in expired {
+                    on_write(&[Bytes::from_static(b"DEL"), key]);
+                }
+            }
         }
     }
 }
@@ -709,7 +724,9 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
     let value = &command[2];
     let size = entry_size(key.len(), value.len());
 
-    if !evict_if_needed(store, size) {
+    // Replicas never evict on their own — the master's stream is authoritative,
+    // so a replica keeps whatever the master sends (ignores maxmemory).
+    if repl().role() == replication::Role::Primary && !evict_if_needed(store, size) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
         return;
     }
@@ -1010,7 +1027,10 @@ fn handle_incr(
 
     let net_size = size.saturating_sub(old_size_for_eviction);
 
-    if net_size > 0 && !evict_if_needed(store, net_size) {
+    if repl().role() == replication::Role::Primary
+        && net_size > 0
+        && !evict_if_needed(store, net_size)
+    {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
         return;
     }
@@ -1102,7 +1122,10 @@ fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
     }
 
     // Only evict if net increase is positive
-    if net_size > 0 && !evict_if_needed(store, net_size as usize) {
+    if repl().role() == replication::Role::Primary
+        && net_size > 0
+        && !evict_if_needed(store, net_size as usize)
+    {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
         return;
     }
@@ -1531,15 +1554,26 @@ async fn handle_connection(
                         let _ = writer.flush(&mut stream).await;
                         continue; // let the client AUTH and retry; don't serve
                     }
-                    // Flush any pending buffered response first.
-                    let _ = writer.flush(&mut stream).await;
-                    if let Some(r) = REPLICATION.get()
-                        && let Err(e) = replication::serve_replica(r, &store, &mut stream).await
-                    {
-                        eprintln!("replica connection ended: {}", e);
+                    if let Some(r) = REPLICATION.get() {
+                        // A replica can't serve PSYNC: its feed is primary-only, so
+                        // a sub-replica would get a snapshot and then no live stream.
+                        // Reject rather than half-serve a silently-stale replica.
+                        if r.role() != replication::Role::Primary {
+                            writer.write_error(b"Can't SYNC: node is a read-only replica");
+                            let _ = writer.flush(&mut stream).await;
+                            continue;
+                        }
+                        // Flush any pending buffered response first.
+                        let _ = writer.flush(&mut stream).await;
+                        if let Err(e) =
+                            replication::serve_replica(r, &store, &mut stream, shutdown_rx.clone())
+                                .await
+                        {
+                            eprintln!("replica connection ended: {}", e);
+                        }
+                        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                        return; // connection is consumed by replication
                     }
-                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-                    return; // connection is consumed by replication
                 }
 
                 execute_command(&store, &command, &mut writer, &mut state, now);
