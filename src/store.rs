@@ -1263,9 +1263,12 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
 }
 
 // Expire random keys (passive expiration)
-pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
+/// Sample `count` random entries and remove any that have expired. Returns the
+/// keys actually removed so the caller (primary) can propagate explicit DELs to
+/// replicas and the AOF — replicas must not expire independently.
+pub fn expire_random_keys(store: &ShardedStore, count: usize) -> Vec<Bytes> {
     let now = get_timestamp();
-    let mut expired_count = 0;
+    let mut expired: Vec<Bytes> = Vec::new();
 
     for _ in 0..count {
         let shard_idx = fastrand::usize(..store.num_shards);
@@ -1278,30 +1281,40 @@ pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
         }
         let skip = fastrand::usize(..len);
 
-        if let Some(entry) = shard.iter().nth(skip)
-            && let Some(expiry) = entry.value().expiry
-            && now >= expiry
-        {
-            let key = entry.key().clone();
-            drop(entry);
+        // Find an expired key. CRITICAL: the `shard.iter()` iterator holds a
+        // read lock on a DashMap internal shard, and in an `if let ... && ...`
+        // chain the iterator temporary would live until the end of the block —
+        // so a `remove_if` on the same shard inside that block deadlocks against
+        // the held read lock. Scope the iterator (and the entry ref) to this
+        // inner block so both guards drop BEFORE we take the write lock.
+        let candidate: Option<Bytes> = {
+            shard
+                .iter()
+                .nth(skip)
+                .and_then(|entry| match entry.value().expiry {
+                    Some(expiry) if now >= expiry => Some(entry.key().clone()),
+                    _ => None,
+                })
+        };
 
+        if let Some(key) = candidate {
             // remove_if ensures we only remove if still expired — prevents deleting
-            // a fresh entry written by a concurrent SET between drop and remove
+            // a fresh entry written by a concurrent SET between sample and remove.
             if let Some((_, removed)) = shard.remove_if(key.as_ref(), |_, v| {
                 v.expiry.map_or(false, |exp| now >= exp)
             }) {
-                expired_count += 1;
                 if CONFIG.memory.max_memory > 0 {
                     MEMORY_USED.fetch_sub(
                         calculate_entry_size(key.len(), &removed.value) as u64,
                         Ordering::Relaxed,
                     );
                 }
+                expired.push(key);
             }
         }
     }
 
-    expired_count
+    expired
 }
 
 // ==================== Pattern Matching ====================
